@@ -1,0 +1,14 @@
+# Minimal requirements for Vercel Python functions - OpenAI only
+# Removed FastAPI/uvicorn (not needed - using BaseHTTPRequestHandler)
+# Removed python-dotenv (not used in Vercel functions)
+# Removed langchain-google-genai to reduce size
+# Pinned setuptools to avoid pkg_resources deprecation issues
+
+crewai==0.11.2
+langchain-core>=0.1.0
+langchain-openai==0.0.5
+openai>=1.0.0,<2.0.0
+pydantic>=2.0.0,<3.0.0
+setuptools<81.0.0
+supabase>=2.0.0,<3.0.0
+
