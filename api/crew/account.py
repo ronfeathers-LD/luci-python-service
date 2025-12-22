@@ -6,12 +6,17 @@ Fetches account data from Supabase and runs analysis
 
 import json
 import os
+import sys
 import warnings
 from http.server import BaseHTTPRequestHandler
 from crewai import Crew, Agent, Task
 from langchain_openai import ChatOpenAI
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sse_helpers import start_sse_response, send_progress, send_result, send_error
 
 # Suppress OpenTelemetry TracerProvider warnings
 # This happens in serverless environments when tracing is initialized multiple times
@@ -302,24 +307,30 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
     
     def do_POST(self):
-        """Handle POST requests"""
+        """Handle POST requests - SSE streaming"""
+        # Start SSE response immediately
+        start_sse_response(self)
+
         try:
             # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
             body_str = self.rfile.read(content_length).decode('utf-8')
-            
+
             # Parse body
             try:
                 body = json.loads(body_str) if body_str else {}
             except json.JSONDecodeError:
                 body = {}
-            
+
+            send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
+
             openai_api_key = body.get('openaiApiKey') or os.environ.get('OPENAI_API_KEY')
             llm = get_llm(openai_api_key=openai_api_key)
             
             # Get accountData from body (if frontend sends it) or fetch it
             account_data = body.get('accountData')
             if not account_data:
+                send_progress(self.wfile, 'Data Fetching', 'Fetching account data from database...', 'System')
                 # Try to fetch from accountId or salesforceAccountId
                 account_id = body.get('accountId')
                 salesforce_account_id = body.get('salesforceAccountId')
@@ -328,9 +339,11 @@ class handler(BaseHTTPRequestHandler):
                     account_data = fetch_account_data(account_id, salesforce_account_id, llm=llm)
                 else:
                     raise ValueError('accountData, accountId, or salesforceAccountId is required')
-            
+
             context = body.get('context', '')
-            
+
+            send_progress(self.wfile, 'Configuration', 'Loading analysis configuration...', 'System')
+
             # Fetch crew configuration from database
             crew_config = fetch_crew_config('account')
             
@@ -389,9 +402,11 @@ Transcripts: {len(account_data.get('transcriptions', []))}"""
             
             full_system_prompt = '\n'.join(system_prompt_parts) if system_prompt_parts else None
             
+            send_progress(self.wfile, 'Setup', 'Preparing analysis agents...', 'System')
+
             # Create agents from database config or fallback to defaults
             agent_configs = crew_config.get('agent_configs', []) if crew_config else []
-            
+
             if not agent_configs:
                 # Fallback to hardcoded defaults
                 agent_configs = [
@@ -406,7 +421,7 @@ Transcripts: {len(account_data.get('transcriptions', []))}"""
                         'backstory': 'You are a strategic advisor with deep expertise in B2B account management.'
                     }
                 ]
-            
+
             agents = []
             agent_map = {}
             
@@ -510,6 +525,11 @@ Requirements:
                 if 'strategy' in task_config.get('description', '').lower() or i == 1:
                     task_map['strategy_task'] = task
             
+            # Send progress updates for each agent that will work
+            for i, agent_config in enumerate(agent_configs):
+                agent_name = agent_config.get('role', f'Agent {i+1}')
+                send_progress(self.wfile, f'Step {i+1}', f'Analyzing account data...', agent_name)
+
             crew = Crew(agents=agents, tasks=tasks, verbose=True)
             result = crew.kickoff()
             result_text = str(result)
@@ -554,29 +574,15 @@ Requirements:
                 # Don't fail the request if save fails - just log it
                 print(f'Error saving crew analysis to database: {save_error}')
             
-            # Send response
-            response_data = {
-                'success': True,
-                'result': result_text,
-                'crewType': 'account',
-                'provider': 'openai'
-            }
-            
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps(response_data, default=str).encode('utf-8'))
-            
+            # Send final result via SSE
+            model_name = os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+            send_result(self.wfile, result_text, provider='openai', model=model_name)
+
         except Exception as e:
             import traceback
-            error_data = {
-                'error': 'Failed to execute account crew',
-                'message': str(e),
-                'traceback': traceback.format_exc() if os.environ.get('DEBUG') else None
-            }
-            
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(error_data).encode('utf-8'))
+            error_message = str(e)
+            if os.environ.get('DEBUG'):
+                error_message = f"{error_message}\n{traceback.format_exc()}"
+
+            # Send error via SSE
+            send_error(self.wfile, error_message)

@@ -6,11 +6,16 @@ Fetches accounts from Supabase and runs portfolio analysis
 
 import json
 import os
+import sys
 import warnings
 from http.server import BaseHTTPRequestHandler
 from crewai import Crew, Agent, Task
 from langchain_openai import ChatOpenAI
 from typing import Optional, List, Dict, Any
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sse_helpers import start_sse_response, send_progress, send_result, send_error
 
 # Suppress OpenTelemetry TracerProvider warnings
 # This happens in serverless environments when tracing is initialized multiple times
@@ -165,35 +170,43 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
     
     def do_POST(self):
-        """Handle POST requests"""
+        """Handle POST requests - SSE streaming"""
+        # Start SSE response immediately
+        start_sse_response(self)
+
         try:
             # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
             body_str = self.rfile.read(content_length).decode('utf-8')
-            
+
             # Parse body
             try:
                 body = json.loads(body_str) if body_str else {}
             except json.JSONDecodeError:
                 body = {}
-            
+
+            send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
+
             openai_api_key = body.get('openaiApiKey') or os.environ.get('OPENAI_API_KEY')
             llm = get_llm(openai_api_key=openai_api_key)
-            
+
             # Get accountsData from body (if frontend sends it) or fetch it
             accounts_data = body.get('accountsData', [])
-            
+
             if not accounts_data:
+                send_progress(self.wfile, 'Data Fetching', 'Fetching account portfolio from database...', 'System')
                 # Try to fetch from userId
                 user_id = body.get('userId')
                 if user_id:
                     accounts_data = fetch_user_accounts(user_id)
                 else:
                     raise ValueError('accountsData or userId is required')
-            
+
             if not accounts_data or len(accounts_data) == 0:
                 raise ValueError('No accounts found to analyze')
-            
+
+            send_progress(self.wfile, 'Configuration', 'Loading analysis configuration...', 'System')
+
             # Fetch crew configuration from database
             crew_config = fetch_crew_config('overview')
             
@@ -220,9 +233,11 @@ class handler(BaseHTTPRequestHandler):
             
             full_system_prompt = '\n'.join(system_prompt_parts) if system_prompt_parts else None
             
+            send_progress(self.wfile, 'Setup', 'Preparing analysis agents...', 'System')
+
             # Create agents from database config or fallback to defaults
             agent_configs = crew_config.get('agent_configs', []) if crew_config else []
-            
+
             if not agent_configs:
                 # Fallback to hardcoded defaults
                 agent_configs = [
@@ -237,7 +252,7 @@ class handler(BaseHTTPRequestHandler):
                         'backstory': 'You are an expert in account prioritization and strategic portfolio management.'
                     }
                 ]
-            
+
             agents = []
             agent_map = {}
             
@@ -327,61 +342,52 @@ class handler(BaseHTTPRequestHandler):
                     task_map['analysis_task'] = task
                 if 'prioritization' in task_config.get('description', '').lower() or i == 1:
                     task_map['prioritization_task'] = task
-            
+
+            # Send progress updates for each agent that will work
+            for i, agent_config in enumerate(agent_configs):
+                agent_name = agent_config.get('role', f'Agent {i+1}')
+                send_progress(self.wfile, f'Step {i+1}', f'Analyzing portfolio data...', agent_name)
+
             crew = Crew(agents=agents, tasks=tasks, verbose=True)
-                    result = crew.kickoff()
-                    result_text = str(result)
-                    
-                    # Save to database
-                    try:
-                        from supabase import create_client, Client
-                        
-                        supabase_url = os.environ.get('SUPABASE_URL')
-                        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-                        
-                        if supabase_url and supabase_key:
-                            supabase: Client = create_client(supabase_url, supabase_key)
-                            
-                            # Get user_id from request body
-                            user_id = body.get('userId')
-                            
-                            if user_id:
-                                save_data = {
-                                    'user_id': user_id,
-                                    'crew_type': 'overview',
-                                    'result': result_text,
-                                    'provider': 'openai',
-                                    'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-                                }
-                                
-                                supabase.table('crew_analysis_history').insert(save_data).execute()
-                    except Exception as save_error:
-                        # Don't fail the request if save fails - just log it
-                        print(f'Error saving crew analysis to database: {save_error}')
-                    
-                    # Send response
-                    response_data = {
-                        'success': True,
-                        'result': result_text,
-                        'crewType': 'overview',
-                        'provider': 'openai'
-                    }
-                    
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(response_data, default=str).encode('utf-8'))
-            
+            result = crew.kickoff()
+            result_text = str(result)
+
+            # Save to database
+            try:
+                from supabase import create_client, Client
+
+                supabase_url = os.environ.get('SUPABASE_URL')
+                supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+
+                if supabase_url and supabase_key:
+                    supabase: Client = create_client(supabase_url, supabase_key)
+
+                    # Get user_id from request body
+                    user_id = body.get('userId')
+
+                    if user_id:
+                        save_data = {
+                            'user_id': user_id,
+                            'crew_type': 'overview',
+                            'result': result_text,
+                            'provider': 'openai',
+                            'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
+                        }
+
+                        supabase.table('crew_analysis_history').insert(save_data).execute()
+            except Exception as save_error:
+                # Don't fail the request if save fails - just log it
+                print(f'Error saving crew analysis to database: {save_error}')
+
+            # Send final result via SSE
+            model_name = os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+            send_result(self.wfile, result_text, provider='openai', model=model_name)
+
         except Exception as e:
             import traceback
-            error_data = {
-                'error': 'Failed to execute overview crew',
-                'message': str(e),
-                'traceback': traceback.format_exc() if os.environ.get('DEBUG') else None
-            }
-            
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(error_data).encode('utf-8'))
+            error_message = str(e)
+            if os.environ.get('DEBUG'):
+                error_message = f"{error_message}\n{traceback.format_exc()}"
+
+            # Send error via SSE
+            send_error(self.wfile, error_message)

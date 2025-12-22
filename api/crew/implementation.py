@@ -6,11 +6,16 @@ Fetches project data from Supabase and runs analysis
 
 import json
 import os
+import sys
 import warnings
 from http.server import BaseHTTPRequestHandler
 from crewai import Crew, Agent, Task
 from langchain_openai import ChatOpenAI
 from typing import Optional, Dict, Any
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sse_helpers import start_sse_response, send_progress, send_result, send_error
 
 # Suppress OpenTelemetry TracerProvider warnings
 # This happens in serverless environments when tracing is initialized multiple times
@@ -174,23 +179,29 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
     
     def do_POST(self):
-        """Handle POST requests"""
+        """Handle POST requests - SSE streaming"""
+        # Start SSE response immediately
+        start_sse_response(self)
+
         try:
             # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
             body_str = self.rfile.read(content_length).decode('utf-8')
-            
+
             # Parse body
             try:
                 body = json.loads(body_str) if body_str else {}
             except json.JSONDecodeError:
                 body = {}
-            
+
+            send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
+
             # Get projectData from body (if frontend sends it) or fetch it
             project_data = body.get('projectData')
             transcriptions = body.get('transcriptions', [])
-            
+
             if not project_data:
+                send_progress(self.wfile, 'Data Fetching', 'Fetching project data from database...', 'System')
                 # Try to fetch from salesforceProjectId
                 salesforce_project_id = body.get('salesforceProjectId')
                 if salesforce_project_id:
@@ -204,10 +215,12 @@ class handler(BaseHTTPRequestHandler):
                         transcriptions = fetched_data.get('transcriptions', [])
                 else:
                     raise ValueError('projectData or salesforceProjectId is required')
-            
+
             openai_api_key = body.get('openaiApiKey') or os.environ.get('OPENAI_API_KEY')
             llm = get_llm(openai_api_key=openai_api_key)
-            
+
+            send_progress(self.wfile, 'Configuration', 'Loading analysis configuration...', 'System')
+
             # Fetch crew configuration from database
             crew_config = fetch_crew_config('implementation')
             
@@ -242,9 +255,11 @@ Transcripts: {len(transcriptions)}"""
             
             full_system_prompt = '\n'.join(system_prompt_parts) if system_prompt_parts else None
             
+            send_progress(self.wfile, 'Setup', 'Preparing analysis agents...', 'System')
+
             # Create agents from database config or fallback to defaults
             agent_configs = crew_config.get('agent_configs', []) if crew_config else []
-            
+
             if not agent_configs:
                 # Fallback to hardcoded defaults
                 agent_configs = [
@@ -259,7 +274,7 @@ Transcripts: {len(transcriptions)}"""
                         'backstory': 'You are an expert implementation coach specializing in customer communication and project management.'
                     }
                 ]
-            
+
             agents = []
             agent_map = {}  # Map role names to Agent objects for task context
             
@@ -350,79 +365,70 @@ Transcripts: {len(transcriptions)}"""
                     task_map['pm_analysis_task'] = task
                 if 'coaching' in task_config.get('description', '').lower() or i == 1:
                     task_map['coaching_task'] = task
-            
-                    crew = Crew(agents=agents, tasks=tasks, verbose=True)
-                    result = crew.kickoff()
-                    result_text = str(result)
-                    
-                    # Save to database
-                    try:
-                        from supabase import create_client, Client
-                        
-                        supabase_url = os.environ.get('SUPABASE_URL')
-                        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-                        
-                        if supabase_url and supabase_key:
-                            supabase: Client = create_client(supabase_url, supabase_key)
-                            
-                            # Get user_id from request body
-                            user_id = body.get('userId')
-                            salesforce_project_id = body.get('salesforceProjectId')
-                            
-                            if user_id and salesforce_project_id:
-                                # Try to get account_id from project
-                                account_id = None
-                                salesforce_account_id = None
-                                try:
-                                    project_result = supabase.table('implementation_projects').select('account_id, salesforce_account_id').eq('salesforce_project_id', salesforce_project_id).limit(1).execute()
-                                    if project_result.data and len(project_result.data) > 0:
-                                        account_id = project_result.data[0].get('account_id')
-                                        salesforce_account_id = project_result.data[0].get('salesforce_account_id')
-                                except Exception as e:
-                                    print(f'Error fetching project account info: {e}')
-                                
-                                save_data = {
-                                    'user_id': user_id,
-                                    'crew_type': 'implementation',
-                                    'result': result_text,
-                                    'provider': 'openai',
-                                    'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-                                    'salesforce_project_id': salesforce_project_id,
-                                }
-                                
-                                if account_id:
-                                    save_data['account_id'] = account_id
-                                if salesforce_account_id:
-                                    save_data['salesforce_account_id'] = salesforce_account_id
-                                
-                                supabase.table('crew_analysis_history').insert(save_data).execute()
-                    except Exception as save_error:
-                        # Don't fail the request if save fails - just log it
-                        print(f'Error saving crew analysis to database: {save_error}')
-                    
-                    # Send response
-                    response_data = {
-                        'success': True,
-                        'result': result_text,
-                        'crewType': 'implementation',
-                        'provider': 'openai'
-                    }
-                    
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(response_data, default=str).encode('utf-8'))
-            
+
+            # Send progress updates for each agent that will work
+            for i, agent_config in enumerate(agent_configs):
+                agent_name = agent_config.get('role', f'Agent {i+1}')
+                send_progress(self.wfile, f'Step {i+1}', f'Analyzing project data...', agent_name)
+
+            crew = Crew(agents=agents, tasks=tasks, verbose=True)
+            result = crew.kickoff()
+            result_text = str(result)
+
+            # Save to database
+            try:
+                from supabase import create_client, Client
+
+                supabase_url = os.environ.get('SUPABASE_URL')
+                supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+
+                if supabase_url and supabase_key:
+                    supabase: Client = create_client(supabase_url, supabase_key)
+
+                    # Get user_id from request body
+                    user_id = body.get('userId')
+                    salesforce_project_id = body.get('salesforceProjectId')
+
+                    if user_id and salesforce_project_id:
+                        # Try to get account_id from project
+                        account_id = None
+                        salesforce_account_id = None
+                        try:
+                            project_result = supabase.table('implementation_projects').select('account_id, salesforce_account_id').eq('salesforce_project_id', salesforce_project_id).limit(1).execute()
+                            if project_result.data and len(project_result.data) > 0:
+                                account_id = project_result.data[0].get('account_id')
+                                salesforce_account_id = project_result.data[0].get('salesforce_account_id')
+                        except Exception as e:
+                            print(f'Error fetching project account info: {e}')
+
+                        save_data = {
+                            'user_id': user_id,
+                            'crew_type': 'implementation',
+                            'result': result_text,
+                            'provider': 'openai',
+                            'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
+                            'salesforce_project_id': salesforce_project_id,
+                        }
+
+                        if account_id:
+                            save_data['account_id'] = account_id
+                        if salesforce_account_id:
+                            save_data['salesforce_account_id'] = salesforce_account_id
+
+                        supabase.table('crew_analysis_history').insert(save_data).execute()
+            except Exception as save_error:
+                # Don't fail the request if save fails - just log it
+                print(f'Error saving crew analysis to database: {save_error}')
+
+            # Send final result via SSE
+            model_name = os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+            send_result(self.wfile, result_text, provider='openai', model=model_name)
+
         except Exception as e:
             import traceback
-            error_data = {
-                'error': 'Failed to execute implementation crew',
-                'message': str(e),
-                'traceback': traceback.format_exc() if os.environ.get('DEBUG') else None
-            }
-            
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(error_data).encode('utf-8'))
+            error_message = str(e)
+            if os.environ.get('DEBUG'):
+                error_message = f"{error_message}\n{traceback.format_exc()}"
+
+            # Send error via SSE
+            send_error(self.wfile, error_message)
