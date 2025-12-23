@@ -1,6 +1,9 @@
 """
 Vercel Python Serverless Function for Sentiment Analysis Crew
 Analyzes customer sentiment from conversation transcriptions and Salesforce context
+
+PERFORMANCE OPTIMIZATION: Heavy imports (crewai, langchain) are lazy-loaded
+inside functions to reduce cold start time by ~1-2 seconds.
 """
 
 import json
@@ -8,15 +11,13 @@ import os
 import sys
 import warnings
 from http.server import BaseHTTPRequestHandler
-from crewai import Crew, Agent, Task
-from langchain_openai import ChatOpenAI
 from typing import Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sse_helpers import start_sse_response, send_progress, send_result, send_error, send_sse_message
 
-# Suppress warnings
+# Suppress warnings early (before heavy imports)
 warnings.filterwarnings('ignore', message='.*Overriding of current TracerProvider.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='opentelemetry')
 warnings.filterwarnings('ignore', category=SyntaxWarning, module='langchain')
@@ -25,8 +26,29 @@ warnings.filterwarnings('ignore', message='.*Mixing V1 models and V2 models.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='crewai')
 warnings.filterwarnings('ignore', category=UserWarning, module='pydantic')
 
+# Lazy-loaded modules (cached after first import)
+_langchain_openai = None
+_crewai = None
+
+def _get_langchain_openai():
+    """Lazy load langchain_openai module"""
+    global _langchain_openai
+    if _langchain_openai is None:
+        from langchain_openai import ChatOpenAI
+        _langchain_openai = ChatOpenAI
+    return _langchain_openai
+
+def _get_crewai():
+    """Lazy load crewai module"""
+    global _crewai
+    if _crewai is None:
+        from crewai import Crew, Agent, Task
+        _crewai = {'Crew': Crew, 'Agent': Agent, 'Task': Task}
+    return _crewai
+
 def get_llm(openai_api_key: Optional[str] = None):
-    """Get OpenAI LLM instance"""
+    """Get OpenAI LLM instance (lazy loads langchain_openai)"""
+    ChatOpenAI = _get_langchain_openai()
     api_key = openai_api_key or os.environ.get('OPENAI_API_KEY')
     if not api_key:
         raise ValueError('OPENAI_API_KEY is required')
@@ -89,7 +111,13 @@ class handler(BaseHTTPRequestHandler):
                 return
             
             send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
-            
+
+            # Lazy load crewai classes (reduces cold start time)
+            crewai = _get_crewai()
+            Agent = crewai['Agent']
+            Task = crewai['Task']
+            Crew = crewai['Crew']
+
             # Initialize LLM
             openai_api_key = body.get('openaiApiKey') or os.environ.get('OPENAI_API_KEY')
             llm = get_llm(openai_api_key=openai_api_key)

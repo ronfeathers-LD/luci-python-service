@@ -2,6 +2,9 @@
 Vercel Python Serverless Function for Account CrewAI Analysis
 OpenAI-only version - optimized for size
 Fetches account data from Supabase and runs analysis
+
+PERFORMANCE OPTIMIZATION: Heavy imports (crewai, langchain) are lazy-loaded
+inside functions to reduce cold start time by ~1-2 seconds.
 """
 
 import json
@@ -9,8 +12,6 @@ import os
 import sys
 import warnings
 from http.server import BaseHTTPRequestHandler
-from crewai import Crew, Agent, Task
-from langchain_openai import ChatOpenAI
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
@@ -18,20 +19,38 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sse_helpers import start_sse_response, send_progress, send_result, send_error
 
-# Suppress OpenTelemetry TracerProvider warnings
-# This happens in serverless environments when tracing is initialized multiple times
+# Suppress warnings early (before heavy imports)
 warnings.filterwarnings('ignore', message='.*Overriding of current TracerProvider.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='opentelemetry')
-
-# Suppress third-party library warnings
 warnings.filterwarnings('ignore', category=SyntaxWarning, module='langchain')
 warnings.filterwarnings('ignore', message='.*pkg_resources is deprecated.*')
 warnings.filterwarnings('ignore', message='.*Mixing V1 models and V2 models.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='crewai')
 warnings.filterwarnings('ignore', category=UserWarning, module='pydantic')
 
+# Lazy-loaded modules (cached after first import)
+_langchain_openai = None
+_crewai = None
+
+def _get_langchain_openai():
+    """Lazy load langchain_openai module"""
+    global _langchain_openai
+    if _langchain_openai is None:
+        from langchain_openai import ChatOpenAI
+        _langchain_openai = ChatOpenAI
+    return _langchain_openai
+
+def _get_crewai():
+    """Lazy load crewai module"""
+    global _crewai
+    if _crewai is None:
+        from crewai import Crew, Agent, Task
+        _crewai = {'Crew': Crew, 'Agent': Agent, 'Task': Task}
+    return _crewai
+
 def get_llm(openai_api_key: Optional[str] = None):
-    """Get OpenAI LLM instance"""
+    """Get OpenAI LLM instance (lazy loads langchain_openai)"""
+    ChatOpenAI = _get_langchain_openai()
     api_key = openai_api_key or os.environ.get('OPENAI_API_KEY')
     if not api_key:
         raise ValueError('OPENAI_API_KEY is required')
@@ -182,58 +201,86 @@ def process_transcription_for_crew(transcription_data: dict, llm, meeting_date_s
     return result
 
 def fetch_account_data(account_id: Optional[str] = None, salesforce_account_id: Optional[str] = None, llm=None):
-    """Fetch account data from Supabase"""
+    """Fetch account data from Supabase with parallel data fetching for performance"""
     try:
         from supabase import create_client, Client
-        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         supabase_url = os.environ.get('SUPABASE_URL')
         supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-        
+
         if not supabase_url or not supabase_key:
             raise ValueError('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set')
-        
+
         supabase: Client = create_client(supabase_url, supabase_key)
-        
-        # Fetch account
+
+        # Fetch account first (needed to get sf_account_id)
         if account_id:
             result = supabase.table('accounts').select('*').eq('id', account_id).limit(1).execute()
         elif salesforce_account_id:
             result = supabase.table('accounts').select('*').eq('salesforce_id', salesforce_account_id).limit(1).execute()
         else:
             raise ValueError('account_id or salesforce_account_id is required')
-        
+
         if not result.data or len(result.data) == 0:
             raise ValueError('Account not found')
-        
+
         account = result.data[0]
         sf_account_id = account.get('salesforce_id')
-        
-        # Fetch contacts
+
+        # Define fetch functions for parallel execution
+        def fetch_contacts():
+            try:
+                # Create new client for thread safety
+                client = create_client(supabase_url, supabase_key)
+                contacts_result = client.table('contacts').select('*').eq('salesforce_account_id', sf_account_id).limit(20).execute()
+                return contacts_result.data if contacts_result.data else []
+            except Exception as e:
+                print(f'Error fetching contacts: {e}')
+                return []
+
+        def fetch_cases():
+            try:
+                client = create_client(supabase_url, supabase_key)
+                cases_result = client.table('cases').select('*').eq('salesforce_account_id', sf_account_id).order('created_date', desc=True).limit(10).execute()
+                return cases_result.data if cases_result.data else []
+            except Exception as e:
+                print(f'Error fetching cases: {e}')
+                return []
+
+        def fetch_transcriptions():
+            try:
+                client = create_client(supabase_url, supabase_key)
+                trans_result = client.table('transcriptions').select('*').eq('salesforce_account_id', sf_account_id).order('meeting_date', desc=True).limit(10).execute()
+                return trans_result.data if trans_result.data else []
+            except Exception as e:
+                print(f'Error fetching transcriptions: {e}')
+                return []
+
+        # Execute all fetches in parallel
         contacts = []
-        try:
-            contacts_result = supabase.table('contacts').select('*').eq('salesforce_account_id', sf_account_id).limit(20).execute()
-            if contacts_result.data:
-                contacts = contacts_result.data
-        except Exception as e:
-            print(f'Error fetching contacts: {e}')
-        
-        # Fetch cases
         cases = []
-        try:
-            cases_result = supabase.table('cases').select('*').eq('salesforce_account_id', sf_account_id).order('created_date', desc=True).limit(10).execute()
-            if cases_result.data:
-                cases = cases_result.data
-        except Exception as e:
-            print(f'Error fetching cases: {e}')
-        
-        # Fetch transcriptions
         transcriptions = []
-        try:
-            trans_result = supabase.table('transcriptions').select('*').eq('salesforce_account_id', sf_account_id).order('meeting_date', desc=True).limit(10).execute()
-            if trans_result.data:
-                transcriptions = trans_result.data
-        except Exception as e:
-            print(f'Error fetching transcriptions: {e}')
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(fetch_contacts): 'contacts',
+                executor.submit(fetch_cases): 'cases',
+                executor.submit(fetch_transcriptions): 'transcriptions'
+            }
+
+            for future in as_completed(futures):
+                data_type = futures[future]
+                try:
+                    result = future.result()
+                    if data_type == 'contacts':
+                        contacts = result
+                    elif data_type == 'cases':
+                        cases = result
+                    elif data_type == 'transcriptions':
+                        transcriptions = result
+                except Exception as e:
+                    print(f'Error in parallel fetch for {data_type}: {e}')
         
         # Process transcriptions based on recency (if LLM is available)
         processed_transcriptions = []
@@ -323,6 +370,12 @@ class handler(BaseHTTPRequestHandler):
                 body = {}
 
             send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
+
+            # Lazy load crewai classes (reduces cold start time)
+            crewai = _get_crewai()
+            Agent = crewai['Agent']
+            Task = crewai['Task']
+            Crew = crewai['Crew']
 
             openai_api_key = body.get('openaiApiKey') or os.environ.get('OPENAI_API_KEY')
             llm = get_llm(openai_api_key=openai_api_key)
