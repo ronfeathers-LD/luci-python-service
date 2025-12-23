@@ -14,7 +14,7 @@ from typing import Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sse_helpers import start_sse_response, send_progress, send_result, send_error
+from sse_helpers import start_sse_response, send_progress, send_result, send_error, send_sse_message
 
 # Suppress warnings
 warnings.filterwarnings('ignore', message='.*Overriding of current TracerProvider.*')
@@ -151,7 +151,7 @@ class handler(BaseHTTPRequestHandler):
             context_string = "\n".join(context_parts)
             
             send_progress(self.wfile, 'Setup', 'Preparing sentiment analysis agents...', 'System')
-            
+
             # Create agents
             conversation_analyst = Agent(
                 role='Conversation Sentiment Analyst',
@@ -195,7 +195,7 @@ class handler(BaseHTTPRequestHandler):
             )
             
             # Create tasks
-            send_progress(self.wfile, 'Step 1', 'Analyzing conversation sentiment...', 'Conversation Sentiment Analyst')
+            send_progress(self.wfile, 'Preparing', 'Setting up conversation analysis task...', 'System')
             
             task1 = Task(
                 description=f'''Analyze the conversation transcription for sentiment indicators.
@@ -221,7 +221,7 @@ Provide detailed analysis of conversation sentiment with emphasis on recent inte
                 expected_output='Detailed analysis of conversation sentiment with recency weighting applied, including tone, language patterns, resolution quality, and satisfaction indicators'
             )
             
-            send_progress(self.wfile, 'Step 2', 'Analyzing support case context...', 'Support Context Analyst')
+            send_progress(self.wfile, 'Preparing', 'Setting up support case analysis task...', 'System')
             
             task2 = Task(
                 description=f'''Analyze support case context and contact involvement.
@@ -251,7 +251,7 @@ Provide detailed analysis of support case context with recency weighting and con
                 expected_output='Detailed analysis of support case patterns, contact involvement, and recency-weighted case assessment'
             )
             
-            send_progress(self.wfile, 'Step 3', 'Synthesizing sentiment analysis...', 'Relationship Health Synthesizer')
+            send_progress(self.wfile, 'Preparing', 'Setting up synthesis task...', 'System')
             
             task3 = Task(
                 description=f'''Synthesize all analysis into a comprehensive sentiment assessment.
@@ -319,13 +319,13 @@ Return your response as a JSON object with this exact structure:
                 verbose=True
             )
             
-            send_progress(self.wfile, 'Step 4', 'Executing crew analysis...', 'Crew')
-            
-            # Execute crew
+            send_progress(self.wfile, 'Analysis', 'Running AI analysis (this may take 1-3 minutes)...', 'AI Crew')
+
+            # Execute crew - this is the main analysis step and takes the longest
             result = crew.kickoff()
             result_text = str(result)
-            
-            send_progress(self.wfile, 'Step 5', 'Processing results...', 'Crew')
+
+            send_progress(self.wfile, 'Complete', 'Processing and saving results...', 'System')
             
             # Parse result - CrewAI returns a string, we need to extract JSON
             parsed_result = None
@@ -373,7 +373,61 @@ Return your response as a JSON object with this exact structure:
                 "summary": summary or "Analysis completed. See comprehensive analysis for details.",
                 "comprehensiveAnalysis": comprehensive_analysis or result_text
             }
-            
+
+            # Save to database (same pattern as account.py)
+            try:
+                from supabase import create_client, Client
+
+                supabase_url = os.environ.get('SUPABASE_URL')
+                supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+
+                if supabase_url and supabase_key:
+                    supabase: Client = create_client(supabase_url, supabase_key)
+
+                    # Get IDs from request body
+                    user_id = body.get('userId')
+                    account_id = body.get('accountId')
+                    salesforce_account_id = body.get('salesforceAccountId')
+
+                    if user_id or account_id or salesforce_account_id:
+                        # Resolve account_id from salesforce_account_id if needed
+                        resolved_account_id = account_id
+                        if not resolved_account_id and salesforce_account_id:
+                            try:
+                                acc_result = supabase.table('accounts').select('id').eq('salesforce_id', salesforce_account_id).limit(1).execute()
+                                if acc_result.data and len(acc_result.data) > 0:
+                                    resolved_account_id = acc_result.data[0].get('id')
+                            except Exception as acc_err:
+                                print(f'Warning: Could not resolve account_id from salesforce_account_id: {acc_err}')
+
+                        # Save to crew_analysis_history
+                        save_data = {
+                            'crew_type': 'sentiment',
+                            'result': json.dumps(final_result),
+                            'provider': 'openai',
+                            'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
+                        }
+
+                        if user_id:
+                            save_data['user_id'] = user_id
+                        if resolved_account_id:
+                            save_data['account_id'] = resolved_account_id
+                        if salesforce_account_id:
+                            save_data['salesforce_account_id'] = salesforce_account_id
+
+                        result_insert = supabase.table('crew_analysis_history').insert(save_data).execute()
+                        if hasattr(result_insert, 'error') and result_insert.error:
+                            print(f'Error saving sentiment analysis to database: {result_insert.error}')
+                        else:
+                            print(f'✅ Saved sentiment analysis to crew_analysis_history')
+                    else:
+                        print('Warning: No userId/accountId/salesforceAccountId provided, skipping database save')
+                else:
+                    print('Warning: Supabase URL or Key not set, skipping database save')
+            except Exception as save_error:
+                # Don't fail the request if save fails - just log it
+                print(f'Error saving sentiment analysis to database: {save_error}')
+
             # Send final result via SSE
             # The Next.js route does: finalResult = data.result || data
             # So we send: {type: 'result', result: {score, summary, comprehensiveAnalysis}}
@@ -381,9 +435,8 @@ Return your response as a JSON object with this exact structure:
                 'type': 'result',
                 'result': final_result  # This becomes finalResult in Next.js, which has score/summary/comprehensiveAnalysis
             }
-            
+
             # Send via SSE using the helper
-            from sse_helpers import send_sse_message
             send_sse_message(self.wfile, result_data)
             
         except Exception as e:
