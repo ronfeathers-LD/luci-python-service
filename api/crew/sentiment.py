@@ -125,7 +125,51 @@ class handler(BaseHTTPRequestHandler):
             # Prepare context for analysis
             transcription_text = transcription or '(No transcription available)'
             customer_identifier = body.get('customerIdentifier', 'Unknown Account')
-            
+            use_rag = body.get('useRag', True)  # Default to using RAG for performance
+
+            # Get account ID for RAG lookup
+            account_id = body.get('accountId')
+            salesforce_account_id = body.get('salesforceAccountId')
+
+            # Try to use RAG for context if enabled and account ID is available
+            rag_context = None
+            if use_rag and (account_id or salesforce_account_id):
+                try:
+                    from rag_helpers import get_relevant_context, get_analysis_query
+
+                    send_progress(self.wfile, 'RAG Search', 'Retrieving relevant context from vector database...', 'System')
+
+                    # Get the account UUID for RAG search
+                    rag_account_id = account_id
+                    if not rag_account_id and salesforce_account_id:
+                        # Resolve salesforce_account_id to UUID
+                        from supabase import create_client
+                        supabase_url = os.environ.get('SUPABASE_URL')
+                        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+                        if supabase_url and supabase_key:
+                            client = create_client(supabase_url, supabase_key)
+                            result = client.table('accounts').select('id').eq('salesforce_id', salesforce_account_id).limit(1).execute()
+                            if result.data:
+                                rag_account_id = result.data[0]['id']
+
+                    if rag_account_id:
+                        # Generate sentiment-specific query for embedding search
+                        analysis_query = get_analysis_query('sentiment')
+                        rag_result = get_relevant_context(
+                            account_id=rag_account_id,
+                            query=analysis_query,
+                            match_count=15,  # Get relevant chunks for sentiment
+                            match_threshold=0.4  # Lower threshold for broader coverage
+                        )
+                        if rag_result.get('context'):
+                            rag_context = rag_result['context']
+                            data_type_counts = rag_result.get('data_type_counts', {})
+                            print(f'RAG retrieved context for sentiment with {len(rag_result.get("chunks", []))} chunks: {data_type_counts}')
+                            send_progress(self.wfile, 'RAG Context', f'Using {len(rag_context)} chars of relevant context', 'System')
+                except Exception as rag_error:
+                    print(f'RAG context retrieval failed for sentiment, using traditional method: {rag_error}')
+                    rag_context = None
+
             # Build context string with recency indicators
             context_parts = []
             context_parts.append(f"Account: {customer_identifier}")
@@ -244,11 +288,36 @@ class handler(BaseHTTPRequestHandler):
                 step_callback=agent_step_callback
             )
             
-            # Create tasks
+            # Create tasks - use RAG context if available, otherwise use raw data
             send_progress(self.wfile, 'Preparing', 'Setting up conversation analysis task...', 'System')
-            
-            task1 = Task(
-                description=f'''Analyze the conversation transcription for sentiment indicators.
+
+            # Build task1 description based on whether RAG context is available
+            if rag_context:
+                task1_description = f'''Analyze the customer conversation data for sentiment indicators.
+
+=== RELEVANT CONTEXT FROM VECTOR DATABASE ===
+The following context was retrieved using semantic search and includes the most relevant
+conversation excerpts, support cases, and account data for sentiment analysis:
+
+{rag_context}
+
+=== ADDITIONAL ACCOUNT INFO ===
+{context_string}
+
+CRITICAL RECENCY WEIGHTING RULES:
+- Context chunks marked with recency information should be weighted accordingly
+- Recent data (0-30 days): 80-90% weight - PRIMARY indicators
+- Historical data (90+ days): 5-10% weight - context only
+
+Analyze:
+1. Initial customer tone and emotional state (focus on most recent)
+2. Language patterns (positive/negative indicators, urgency, frustration) - recent patterns matter most
+3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
+4. Final outcome and customer satisfaction level - prioritize most recent meetings
+
+Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+            else:
+                task1_description = f'''Analyze the conversation transcription for sentiment indicators.
 
 CONVERSATION TRANSCRIPTION:
 {transcription_text}
@@ -266,18 +335,23 @@ Analyze:
 3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
 4. Final outcome and customer satisfaction level - prioritize most recent meetings
 
-Provide detailed analysis of conversation sentiment with emphasis on recent interactions.''',
+Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+
+            task1 = Task(
+                description=task1_description,
                 agent=conversation_analyst,
                 expected_output='Detailed analysis of conversation sentiment with recency weighting applied, including tone, language patterns, resolution quality, and satisfaction indicators'
             )
-            
+
             send_progress(self.wfile, 'Preparing', 'Setting up support case analysis task...', 'System')
-            
-            task2 = Task(
-                description=f'''Analyze support case context and contact involvement.
+
+            # Build task2 description - always use context_string but note if RAG was used for task1
+            task2_description = f'''Analyze support case context and contact involvement.
 
 SALESFORCE ACCOUNT CONTEXT:
 {context_string}
+
+{'NOTE: Task 1 used RAG-retrieved context which includes relevant case excerpts.' if rag_context else ''}
 
 CRITICAL RECENCY WEIGHTING RULES:
 - Cases marked [MOST_RECENT] or [RECENT] (0-30 days): 80-90% weight - PRIMARY indicators
@@ -296,7 +370,10 @@ Analyze:
 4. Contact level involvement (C-Level/Sr. Level = major concern)
 5. Resolution timelines and patterns
 
-Provide detailed analysis of support case context with recency weighting and contact level assessment.''',
+Provide detailed analysis of support case context with recency weighting and contact level assessment.'''
+
+            task2 = Task(
+                description=task2_description,
                 agent=support_analyst,
                 expected_output='Detailed analysis of support case patterns, contact involvement, and recency-weighted case assessment'
             )

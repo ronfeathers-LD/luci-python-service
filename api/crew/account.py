@@ -394,55 +394,109 @@ class handler(BaseHTTPRequestHandler):
                     raise ValueError('accountData, accountId, or salesforceAccountId is required')
 
             context = body.get('context', '')
+            use_rag = body.get('useRag', True)  # Default to using RAG for performance
 
             send_progress(self.wfile, 'Configuration', 'Loading analysis configuration...', 'System')
 
             # Fetch crew configuration from database
             crew_config = fetch_crew_config('account')
-            
-            # Build account context with full data
-            account_context = f"""Account: {account_data.get('name', 'Unknown')}
+
+            # Try to use RAG for context if enabled and account ID is available
+            rag_context = None
+            if use_rag and (account_id or salesforce_account_id):
+                try:
+                    from rag_helpers import get_relevant_context, get_analysis_query
+
+                    send_progress(self.wfile, 'RAG Search', 'Retrieving relevant context from vector database...', 'System')
+
+                    # Get the account UUID for RAG search
+                    rag_account_id = account_id
+                    if not rag_account_id and salesforce_account_id:
+                        # Resolve salesforce_account_id to UUID
+                        from supabase import create_client
+                        supabase_url = os.environ.get('SUPABASE_URL')
+                        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+                        if supabase_url and supabase_key:
+                            client = create_client(supabase_url, supabase_key)
+                            result = client.table('accounts').select('id').eq('salesforce_id', salesforce_account_id).limit(1).execute()
+                            if result.data:
+                                rag_account_id = result.data[0]['id']
+
+                    if rag_account_id:
+                        # Generate analysis-specific query for embedding search
+                        analysis_query = get_analysis_query('account')
+                        rag_result = get_relevant_context(
+                            account_id=rag_account_id,
+                            query=analysis_query,
+                            match_count=20,  # Get more chunks for comprehensive analysis
+                            match_threshold=0.4  # Lower threshold for broader coverage
+                        )
+                        if rag_result.get('context'):
+                            rag_context = rag_result['context']
+                            data_type_counts = rag_result.get('data_type_counts', {})
+                            print(f'RAG retrieved context with {len(rag_result.get("chunks", []))} chunks: {data_type_counts}')
+                except Exception as rag_error:
+                    print(f'RAG context retrieval failed, falling back to traditional method: {rag_error}')
+                    rag_context = None
+
+            # Build account context - use RAG context if available, otherwise build from raw data
+            if rag_context:
+                # Use RAG context (much more efficient - fewer tokens, relevant chunks only)
+                send_progress(self.wfile, 'RAG Context', f'Using {len(rag_context)} chars of relevant context from vector DB', 'System')
+                account_context = f"""Account: {account_data.get('name', 'Unknown')}
 Tier: {account_data.get('account_tier', 'Unknown')}
 Value: {account_data.get('contract_value', 'Unknown')}
 Industry: {account_data.get('industry', 'Unknown')}
 Contacts: {len(account_data.get('contacts', []))}
 Cases: {len(account_data.get('cases', []))}
-Transcripts: {len(account_data.get('transcriptions', []))}"""
-            
-            # Add contacts details
-            contacts = account_data.get('contacts', [])
-            if contacts:
-                account_context += f"\n\nContacts ({len(contacts)}):"
-                for contact in contacts[:5]:  # Limit to first 5
-                    account_context += f"\n- {contact.get('name', 'Unknown')} ({contact.get('email', 'No email')})"
-            
-            # Add cases details with case numbers
-            cases = account_data.get('cases', [])
-            if cases:
-                account_context += f"\n\nSupport Cases ({len(cases)}):"
-                for case in cases[:5]:  # Limit to first 5
-                    case_number = case.get('case_number') or case.get('id') or 'N/A'
-                    account_context += f"\n- Case #{case_number}: {case.get('subject', 'No subject')} (Status: {case.get('status', 'Unknown')}, Priority: {case.get('priority', 'Unknown')}, Created: {case.get('created_date', 'Unknown')})"
-                    if case.get('description'):
-                        desc = case.get('description', '')[:300]
-                        account_context += f"\n  Description: {desc}{'...' if len(case.get('description', '')) > 300 else ''}"
-            
-            # Add transcriptions with processed text
-            transcriptions = account_data.get('transcriptions', [])
-            if transcriptions:
-                account_context += f"\n\nMeeting Transcripts ({len(transcriptions)}):"
-                for i, trans in enumerate(transcriptions[:5], 1):  # Limit to first 5
-                    meeting = trans.get('meeting', {})
-                    subject = meeting.get('subject', 'Unknown Meeting')
-                    date = meeting.get('meeting_date', 'Unknown Date')
-                    text = trans.get('transcription', '')
-                    processing_note = trans.get('processing_note', '')
-                    
-                    note_text = f" [{processing_note}]" if processing_note and processing_note != 'full_text' else ""
-                    account_context += f"\n\n--- Meeting {i}: {subject} ({date}){note_text} ---\n{text}"
-            
-            if context:
-                account_context += f"\n\nAdditional Context: {context}"
+Transcripts: {len(account_data.get('transcriptions', []))}
+
+=== RELEVANT CONTEXT (from vector search) ===
+{rag_context}"""
+
+                if context:
+                    account_context += f"\n\nAdditional Context: {context}"
+            else:
+                # Fallback: Build context from raw data (traditional method)
+                account_context = f"""Account: {account_data.get('name', 'Unknown')}
+Tier: {account_data.get('account_tier', 'Unknown')}
+Value: {account_data.get('contract_value', 'Unknown')}
+Industry: {account_data.get('industry', 'Unknown')}"""
+
+                # Add contacts details
+                contacts = account_data.get('contacts', [])
+                if contacts:
+                    account_context += f"\n\nContacts ({len(contacts)}):"
+                    for contact in contacts[:5]:  # Limit to first 5
+                        account_context += f"\n- {contact.get('name', 'Unknown')} ({contact.get('email', 'No email')})"
+
+                # Add cases details with case numbers
+                cases = account_data.get('cases', [])
+                if cases:
+                    account_context += f"\n\nSupport Cases ({len(cases)}):"
+                    for case in cases[:5]:  # Limit to first 5
+                        case_number = case.get('case_number') or case.get('id') or 'N/A'
+                        account_context += f"\n- Case #{case_number}: {case.get('subject', 'No subject')} (Status: {case.get('status', 'Unknown')}, Priority: {case.get('priority', 'Unknown')}, Created: {case.get('created_date', 'Unknown')})"
+                        if case.get('description'):
+                            desc = case.get('description', '')[:300]
+                            account_context += f"\n  Description: {desc}{'...' if len(case.get('description', '')) > 300 else ''}"
+
+                # Add transcriptions with processed text
+                transcriptions = account_data.get('transcriptions', [])
+                if transcriptions:
+                    account_context += f"\n\nMeeting Transcripts ({len(transcriptions)}):"
+                    for i, trans in enumerate(transcriptions[:5], 1):  # Limit to first 5
+                        meeting = trans.get('meeting', {})
+                        subject = meeting.get('subject', 'Unknown Meeting')
+                        date = meeting.get('meeting_date', 'Unknown Date')
+                        text = trans.get('transcription', '')
+                        processing_note = trans.get('processing_note', '')
+
+                        note_text = f" [{processing_note}]" if processing_note and processing_note != 'full_text' else ""
+                        account_context += f"\n\n--- Meeting {i}: {subject} ({date}){note_text} ---\n{text}"
+
+                if context:
+                    account_context += f"\n\nAdditional Context: {context}"
             
             # Build system prompt with evaluation criteria and scoring rubric if available
             system_prompt_parts = []
