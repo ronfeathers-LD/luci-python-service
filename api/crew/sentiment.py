@@ -152,7 +152,26 @@ class handler(BaseHTTPRequestHandler):
             
             send_progress(self.wfile, 'Setup', 'Preparing sentiment analysis agents...', 'System')
 
-            # Create agents
+            # Create step callback for real-time progress updates
+            wfile_ref = self.wfile  # Capture for closure
+            step_count = [0]  # Mutable container for step counter
+
+            def agent_step_callback(step_output):
+                """Send progress update after each agent step"""
+                try:
+                    step_count[0] += 1
+                    # Extract meaningful info from step output
+                    step_str = str(step_output)[:150] if step_output else 'Processing...'
+                    # Clean up the output for display
+                    if 'Action:' in step_str:
+                        step_str = step_str.split('Action:')[0].strip()[:100]
+                    elif len(step_str) > 100:
+                        step_str = step_str[:100] + '...'
+                    send_progress(wfile_ref, f'Step {step_count[0]}', f'Agent working: {step_str}', 'AI Analysis')
+                except Exception as e:
+                    print(f'Step callback error: {e}')
+
+            # Create agents with step_callback for progress monitoring
             conversation_analyst = Agent(
                 role='Conversation Sentiment Analyst',
                 goal='Extract emotional tone, language patterns, and satisfaction signals from customer conversations, applying recency weighting where recent conversations (0-30 days) are PRIMARY indicators (80-90% weight) and historical conversations (90+ days) provide context only (5-10% weight)',
@@ -163,7 +182,8 @@ class handler(BaseHTTPRequestHandler):
 - Resolution quality and how concerns were addressed are critical indicators
 - Final outcome and customer satisfaction level should be assessed from most recent meetings''',
                 llm=llm,
-                verbose=True
+                verbose=True,
+                step_callback=agent_step_callback
             )
             
             support_analyst = Agent(
@@ -176,9 +196,10 @@ class handler(BaseHTTPRequestHandler):
 - Case priorities, statuses, and descriptions reveal customer frustration levels
 - Resolution timelines and patterns indicate relationship health''',
                 llm=llm,
-                verbose=True
+                verbose=True,
+                step_callback=agent_step_callback
             )
-            
+
             synthesizer = Agent(
                 role='Relationship Health Synthesizer',
                 goal='Synthesize all analysis into comprehensive sentiment assessment with executive summary (150 words max) and detailed analysis (500-800 words), providing sentiment score (1-10) with detailed reasoning',
@@ -191,7 +212,8 @@ class handler(BaseHTTPRequestHandler):
 - Executive summary must be concise for C-level executives
 - Comprehensive analysis must be detailed for CSMs and Account Managers''',
                 llm=llm,
-                verbose=True
+                verbose=True,
+                step_callback=agent_step_callback
             )
             
             # Create tasks
