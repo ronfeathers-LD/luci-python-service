@@ -133,7 +133,11 @@ class handler(BaseHTTPRequestHandler):
 
             # Try to use RAG for context if enabled and account ID is available
             rag_context = None
+            avoma_context = None
+            context_source = 'traditional'  # Track where context came from
+
             if use_rag and (account_id or salesforce_account_id):
+                # Step 1: Try RAG (fastest - uses pre-computed embeddings)
                 try:
                     from rag_helpers import get_relevant_context, get_analysis_query
 
@@ -163,12 +167,39 @@ class handler(BaseHTTPRequestHandler):
                         )
                         if rag_result.get('context'):
                             rag_context = rag_result['context']
+                            context_source = 'rag'
                             data_type_counts = rag_result.get('data_type_counts', {})
                             print(f'RAG retrieved context for sentiment with {len(rag_result.get("chunks", []))} chunks: {data_type_counts}')
                             send_progress(self.wfile, 'RAG Context', f'Using {len(rag_context)} chars of relevant context', 'System')
                 except Exception as rag_error:
-                    print(f'RAG context retrieval failed for sentiment, using traditional method: {rag_error}')
+                    print(f'RAG context retrieval failed for sentiment: {rag_error}')
                     rag_context = None
+
+                # Step 2: If RAG failed or returned no context, try Avoma API (real-time fetch)
+                if not rag_context:
+                    try:
+                        from avoma_helpers import get_avoma_context_for_account
+
+                        send_progress(self.wfile, 'Avoma Fetch', 'Fetching meeting data from Avoma...', 'System')
+
+                        avoma_result = get_avoma_context_for_account(
+                            salesforce_account_id=salesforce_account_id,
+                            customer_name=customer_identifier,
+                            account_id=account_id,
+                            max_meetings=5,
+                            max_transcript_chars=10000
+                        )
+
+                        if avoma_result.get('success') and avoma_result.get('context'):
+                            avoma_context = avoma_result['context']
+                            context_source = 'avoma'
+                            print(f'Avoma retrieved context for sentiment: {len(avoma_result.get("meetings", []))} meetings, {len(avoma_context)} chars')
+                            send_progress(self.wfile, 'Avoma Context', f'Using {len(avoma_context)} chars from Avoma', 'System')
+                        else:
+                            print(f'Avoma fetch failed or returned no data: {avoma_result.get("error", "Unknown error")}')
+                    except Exception as avoma_error:
+                        print(f'Avoma context retrieval failed for sentiment: {avoma_error}')
+                        avoma_context = None
 
             # Build context string with recency indicators
             context_parts = []
@@ -291,7 +322,7 @@ class handler(BaseHTTPRequestHandler):
             # Create tasks - use RAG context if available, otherwise use raw data
             send_progress(self.wfile, 'Preparing', 'Setting up conversation analysis task...', 'System')
 
-            # Build task1 description based on whether RAG context is available
+            # Build task1 description based on context source: RAG > Avoma > traditional
             if rag_context:
                 task1_description = f'''Analyze the customer conversation data for sentiment indicators.
 
@@ -306,6 +337,29 @@ conversation excerpts, support cases, and account data for sentiment analysis:
 
 CRITICAL RECENCY WEIGHTING RULES:
 - Context chunks marked with recency information should be weighted accordingly
+- Recent data (0-30 days): 80-90% weight - PRIMARY indicators
+- Historical data (90+ days): 5-10% weight - context only
+
+Analyze:
+1. Initial customer tone and emotional state (focus on most recent)
+2. Language patterns (positive/negative indicators, urgency, frustration) - recent patterns matter most
+3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
+4. Final outcome and customer satisfaction level - prioritize most recent meetings
+
+Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+            elif avoma_context:
+                task1_description = f'''Analyze the customer conversation data for sentiment indicators.
+
+=== MEETING DATA FROM AVOMA ===
+The following meeting transcripts were fetched in real-time from Avoma:
+
+{avoma_context}
+
+=== ADDITIONAL ACCOUNT INFO ===
+{context_string}
+
+CRITICAL RECENCY WEIGHTING RULES:
+- Focus on most recent meetings for current sentiment assessment
 - Recent data (0-30 days): 80-90% weight - PRIMARY indicators
 - Historical data (90+ days): 5-10% weight - context only
 

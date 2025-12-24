@@ -403,7 +403,11 @@ class handler(BaseHTTPRequestHandler):
 
             # Try to use RAG for context if enabled and account ID is available
             rag_context = None
+            avoma_context = None
+            context_source = 'raw_data'  # Track where context came from
+
             if use_rag and (account_id or salesforce_account_id):
+                # Step 1: Try RAG (fastest - uses pre-computed embeddings)
                 try:
                     from rag_helpers import get_relevant_context, get_analysis_query
 
@@ -433,15 +437,41 @@ class handler(BaseHTTPRequestHandler):
                         )
                         if rag_result.get('context'):
                             rag_context = rag_result['context']
+                            context_source = 'rag'
                             data_type_counts = rag_result.get('data_type_counts', {})
                             print(f'RAG retrieved context with {len(rag_result.get("chunks", []))} chunks: {data_type_counts}')
                 except Exception as rag_error:
-                    print(f'RAG context retrieval failed, falling back to traditional method: {rag_error}')
+                    print(f'RAG context retrieval failed: {rag_error}')
                     rag_context = None
 
-            # Build account context - use RAG context if available, otherwise build from raw data
+                # Step 2: If RAG failed or returned no context, try Avoma API (real-time fetch)
+                if not rag_context:
+                    try:
+                        from avoma_helpers import get_avoma_context_for_account
+
+                        send_progress(self.wfile, 'Avoma Fetch', 'Fetching meeting data from Avoma...', 'System')
+
+                        avoma_result = get_avoma_context_for_account(
+                            salesforce_account_id=salesforce_account_id,
+                            customer_name=account_data.get('name'),
+                            account_id=account_id,
+                            max_meetings=5,
+                            max_transcript_chars=10000
+                        )
+
+                        if avoma_result.get('success') and avoma_result.get('context'):
+                            avoma_context = avoma_result['context']
+                            context_source = 'avoma'
+                            print(f'Avoma retrieved context: {len(avoma_result.get("meetings", []))} meetings, {len(avoma_context)} chars')
+                        else:
+                            print(f'Avoma fetch failed or returned no data: {avoma_result.get("error", "Unknown error")}')
+                    except Exception as avoma_error:
+                        print(f'Avoma context retrieval failed: {avoma_error}')
+                        avoma_context = None
+
+            # Build account context - use RAG > Avoma > raw data (in order of preference)
             if rag_context:
-                # Use RAG context (much more efficient - fewer tokens, relevant chunks only)
+                # Use RAG context (fastest - pre-computed embeddings, relevant chunks only)
                 send_progress(self.wfile, 'RAG Context', f'Using {len(rag_context)} chars of relevant context from vector DB', 'System')
                 account_context = f"""Account: {account_data.get('name', 'Unknown')}
 Tier: {account_data.get('account_tier', 'Unknown')}
@@ -453,6 +483,29 @@ Transcripts: {len(account_data.get('transcriptions', []))}
 
 === RELEVANT CONTEXT (from vector search) ===
 {rag_context}"""
+
+                if context:
+                    account_context += f"\n\nAdditional Context: {context}"
+            elif avoma_context:
+                # Use Avoma context (real-time fetch from Avoma API)
+                send_progress(self.wfile, 'Avoma Context', f'Using {len(avoma_context)} chars of meeting data from Avoma', 'System')
+                account_context = f"""Account: {account_data.get('name', 'Unknown')}
+Tier: {account_data.get('account_tier', 'Unknown')}
+Value: {account_data.get('contract_value', 'Unknown')}
+Industry: {account_data.get('industry', 'Unknown')}
+Contacts: {len(account_data.get('contacts', []))}
+Cases: {len(account_data.get('cases', []))}
+
+=== MEETING DATA (from Avoma) ===
+{avoma_context}"""
+
+                # Add cases from Supabase since Avoma doesn't have them
+                cases = account_data.get('cases', [])
+                if cases:
+                    account_context += f"\n\n=== SUPPORT CASES (from database) ==="
+                    for case in cases[:5]:
+                        case_number = case.get('case_number') or case.get('id') or 'N/A'
+                        account_context += f"\n- Case #{case_number}: {case.get('subject', 'No subject')} (Status: {case.get('status', 'Unknown')}, Priority: {case.get('priority', 'Unknown')})"
 
                 if context:
                     account_context += f"\n\nAdditional Context: {context}"
