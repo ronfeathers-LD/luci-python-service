@@ -267,7 +267,7 @@ class handler(BaseHTTPRequestHandler):
             
             context_string = "\n".join(context_parts)
             
-            send_progress(self.wfile, 'Setup', 'Preparing sentiment analysis agents...', 'System')
+            send_progress(self.wfile, 'Setup', 'Preparing sentiment analysis...', 'System')
 
             # Create step callback for real-time progress updates
             wfile_ref = self.wfile  # Capture for closure
@@ -277,240 +277,103 @@ class handler(BaseHTTPRequestHandler):
                 """Send progress update after each agent step"""
                 try:
                     step_count[0] += 1
-                    # Extract meaningful info from step output
                     step_str = str(step_output)[:150] if step_output else 'Processing...'
-                    # Clean up the output for display
                     if 'Action:' in step_str:
                         step_str = step_str.split('Action:')[0].strip()[:100]
                     elif len(step_str) > 100:
                         step_str = step_str[:100] + '...'
-                    send_progress(wfile_ref, f'Step {step_count[0]}', f'Agent working: {step_str}', 'AI Analysis')
+                    send_progress(wfile_ref, f'Step {step_count[0]}', f'Analyzing: {step_str}', 'AI Analysis')
                 except Exception as e:
                     print(f'Step callback error: {e}')
 
-            # Create agents with step_callback for progress monitoring
-            conversation_analyst = Agent(
-                role='Conversation Sentiment Analyst',
-                goal='Extract emotional tone, language patterns, and satisfaction signals from customer conversations, applying recency weighting where recent conversations (0-30 days) are PRIMARY indicators (80-90% weight) and historical conversations (90+ days) provide context only (5-10% weight)',
-                backstory='''You are an expert at analyzing B2B customer conversations. You understand that:
-- Recent conversations (last 30 days) are the PRIMARY indicators of current sentiment (80-90% weight)
-- Historical conversations (90+ days old) provide context only (5-10% weight)
-- Language patterns, emotional indicators, urgency, and frustration levels reveal true sentiment
-- Resolution quality and how concerns were addressed are critical indicators
-- Final outcome and customer satisfaction level should be assessed from most recent meetings''',
+            # OPTIMIZED: Single comprehensive agent instead of 3 separate agents
+            # This reduces LLM calls from 3 to 1, significantly improving performance
+            sentiment_analyst = Agent(
+                role='Customer Sentiment Analyst',
+                goal='Analyze customer sentiment from conversations and support data, producing a comprehensive assessment with score (1-10), executive summary, and detailed analysis',
+                backstory='''You are an expert B2B customer sentiment analyst who synthesizes conversation data,
+support cases, and account context into actionable insights. You excel at:
+- Identifying emotional tone and satisfaction signals from conversations
+- Recognizing patterns in support case data that indicate customer health
+- Understanding that C-Level/Sr. involvement in cases indicates escalation
+- Applying recency weighting (recent data 80-90%, historical 5-10%)
+- Producing clear executive summaries and detailed analysis''',
                 llm=llm,
                 verbose=True,
                 step_callback=agent_step_callback
             )
             
-            support_analyst = Agent(
-                role='Support Context Analyst',
-                goal='Evaluate support case patterns, priorities, contact level involvement, and apply recency weighting where recent cases (last 30 days) are PRIMARY indicators (80-90% weight) and historical cases (90+ days) provide trend context only (5-10% weight)',
-                backstory='''You specialize in understanding how support case patterns reveal underlying customer issues. You know that:
-- Recent cases (last 30 days) are PRIMARY indicators of current sentiment (80-90% weight)
-- Historical cases (90+ days) are for trend context only (5-10% weight)
-- C-Level or Sr. Level involvement in cases is a MAJOR RED FLAG indicating escalated problems
-- Case priorities, statuses, and descriptions reveal customer frustration levels
-- Resolution timelines and patterns indicate relationship health''',
-                llm=llm,
-                verbose=True,
-                step_callback=agent_step_callback
-            )
+            # OPTIMIZED: Single comprehensive task instead of 3 separate tasks
+            # This reduces LLM calls from 3 to 1, significantly improving performance
+            send_progress(self.wfile, 'Preparing', 'Setting up analysis task...', 'System')
 
-            synthesizer = Agent(
-                role='Relationship Health Synthesizer',
-                goal='Synthesize all analysis into comprehensive sentiment assessment with executive summary (150 words max) and detailed analysis (500-800 words), providing sentiment score (1-10) with detailed reasoning',
-                backstory='''You are an expert at synthesizing complex customer relationship data into clear, actionable insights. You understand:
-- Account tiers, contract values, and industry context affect expectations
-- Engagement metrics (Avoma calls, transcripts) indicate relationship strength
-- Relationship trajectory (improving, declining, stable) must be assessed with evidence
-- Risk factors and opportunities must be clearly identified
-- Recommendations must be specific and actionable
-- Executive summary must be concise for C-level executives
-- Comprehensive analysis must be detailed for CSMs and Account Managers''',
-                llm=llm,
-                verbose=True,
-                step_callback=agent_step_callback
-            )
-            
-            # Create tasks - use RAG context if available, otherwise use raw data
-            send_progress(self.wfile, 'Preparing', 'Setting up conversation analysis task...', 'System')
-
-            # Build task1 description based on context source: RAG > Avoma > traditional
+            # Build context based on source: RAG > Avoma > traditional
             if rag_context:
-                task1_description = f'''Analyze the customer conversation data for sentiment indicators.
-
-=== RELEVANT CONTEXT FROM VECTOR DATABASE ===
-The following context was retrieved using semantic search and includes the most relevant
-conversation excerpts, support cases, and account data for sentiment analysis:
-
+                data_context = f'''=== RELEVANT CONTEXT (from vector database) ===
 {rag_context}
 
-=== ADDITIONAL ACCOUNT INFO ===
-{context_string}
-
-CRITICAL RECENCY WEIGHTING RULES:
-- Context chunks marked with recency information should be weighted accordingly
-- Recent data (0-30 days): 80-90% weight - PRIMARY indicators
-- Historical data (90+ days): 5-10% weight - context only
-
-Analyze:
-1. Initial customer tone and emotional state (focus on most recent)
-2. Language patterns (positive/negative indicators, urgency, frustration) - recent patterns matter most
-3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
-4. Final outcome and customer satisfaction level - prioritize most recent meetings
-
-Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+=== ACCOUNT INFO ===
+{context_string}'''
             elif avoma_context:
-                task1_description = f'''Analyze the customer conversation data for sentiment indicators.
-
-=== MEETING DATA FROM AVOMA ===
-The following meeting transcripts were fetched in real-time from Avoma:
-
+                data_context = f'''=== MEETING DATA (from Avoma) ===
 {avoma_context}
 
-=== ADDITIONAL ACCOUNT INFO ===
-{context_string}
-
-CRITICAL RECENCY WEIGHTING RULES:
-- Focus on most recent meetings for current sentiment assessment
-- Recent data (0-30 days): 80-90% weight - PRIMARY indicators
-- Historical data (90+ days): 5-10% weight - context only
-
-Analyze:
-1. Initial customer tone and emotional state (focus on most recent)
-2. Language patterns (positive/negative indicators, urgency, frustration) - recent patterns matter most
-3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
-4. Final outcome and customer satisfaction level - prioritize most recent meetings
-
-Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+=== ACCOUNT INFO ===
+{context_string}'''
             else:
-                task1_description = f'''Analyze the conversation transcription for sentiment indicators.
-
-CONVERSATION TRANSCRIPTION:
+                data_context = f'''=== CONVERSATION DATA ===
 {transcription_text}
 
-CRITICAL RECENCY WEIGHTING RULES:
-- If transcription is marked with recency labels ([MOST_RECENT], [RECENT], [HISTORICAL]), apply weighting:
-  * [MOST_RECENT] or [RECENT] (0-30 days): 80-90% weight - PRIMARY indicators
-  * [HISTORICAL] (90+ days): 5-10% weight - context only
-- Focus on most recent conversations for current sentiment assessment
-- Historical conversations provide trend context but should NOT drive the score
+=== ACCOUNT INFO ===
+{context_string}'''
 
-Analyze:
-1. Initial customer tone and emotional state (focus on most recent)
-2. Language patterns (positive/negative indicators, urgency, frustration) - recent patterns matter most
-3. Resolution quality and how concerns were addressed - recent resolutions are most relevant
-4. Final outcome and customer satisfaction level - prioritize most recent meetings
+            # Single comprehensive task
+            analysis_task = Task(
+                description=f'''Analyze customer sentiment and produce a comprehensive assessment.
 
-Provide detailed analysis of conversation sentiment with emphasis on recent interactions.'''
+=== ACCOUNT PROFILE ===
+Account: {customer_identifier}
+Tier: {salesforce_context.get('account_tier', 'Unknown')}
+Contract Value: {salesforce_context.get('contract_value', 'Unknown')}
+Industry: {salesforce_context.get('industry', 'Unknown')}
+Account Manager: {salesforce_context.get('account_manager', 'Unknown')}
+Avoma Calls: {salesforce_context.get('total_avoma_calls', 0)} total, {salesforce_context.get('ready_avoma_calls', 0)} with transcripts
 
-            task1 = Task(
-                description=task1_description,
-                agent=conversation_analyst,
-                expected_output='Detailed analysis of conversation sentiment with recency weighting applied, including tone, language patterns, resolution quality, and satisfaction indicators'
-            )
+{data_context}
 
-            send_progress(self.wfile, 'Preparing', 'Setting up support case analysis task...', 'System')
+=== ANALYSIS REQUIREMENTS ===
 
-            # Build task2 description - always use context_string but note if RAG was used for task1
-            task2_description = f'''Analyze support case context and contact involvement.
-
-SALESFORCE ACCOUNT CONTEXT:
-{context_string}
-
-{'NOTE: Task 1 used RAG-retrieved context which includes relevant case excerpts.' if rag_context else ''}
-
-CRITICAL RECENCY WEIGHTING RULES:
-- Cases marked [MOST_RECENT] or [RECENT] (0-30 days): 80-90% weight - PRIMARY indicators
-- Cases marked [HISTORICAL] (90+ days): 5-10% weight - trend context only
-- Focus on cases from last 30 days as they indicate CURRENT issues
-
-CRITICAL CONTACT LEVEL ANALYSIS:
-- C-Level involvement in cases = MAJOR RED FLAG (indicates escalated problems)
-- Sr. Level involvement in cases = SIGNIFICANT CONCERN (indicates frustration)
-- Weight case involvement by contact level heavily
-
-Analyze:
-1. Support case patterns and trends (recent cases are PRIMARY indicators)
-2. Case priorities and statuses (high priority or unresolved = issues)
-3. Case descriptions for customer feedback and issue details
-4. Contact level involvement (C-Level/Sr. Level = major concern)
-5. Resolution timelines and patterns
-
-Provide detailed analysis of support case context with recency weighting and contact level assessment.'''
-
-            task2 = Task(
-                description=task2_description,
-                agent=support_analyst,
-                expected_output='Detailed analysis of support case patterns, contact involvement, and recency-weighted case assessment'
-            )
-            
-            send_progress(self.wfile, 'Preparing', 'Setting up synthesis task...', 'System')
-            
-            task3 = Task(
-                description=f'''Synthesize all analysis into a comprehensive sentiment assessment.
-
-ACCOUNT PROFILE:
-- Account: {customer_identifier}
-- Tier: {salesforce_context.get('account_tier', 'Unknown')}
-- Contract Value: {salesforce_context.get('contract_value', 'Unknown')}
-- Industry: {salesforce_context.get('industry', 'Unknown')}
-- Account Manager: {salesforce_context.get('account_manager', 'Unknown')}
-
-ENGAGEMENT METRICS:
-- Total Avoma Calls: {salesforce_context.get('total_avoma_calls', 0)}
-- Ready Transcripts: {salesforce_context.get('ready_avoma_calls', 0)}
-
-You will receive:
-1. Conversation sentiment analysis from Conversation Sentiment Analyst
-2. Support case context analysis from Support Context Analyst
-
-Your task:
-1. Synthesize both analyses into a single comprehensive assessment
-2. Consider account profile (tier, contract value, industry) - higher value accounts may have different expectations
-3. Evaluate relationship trajectory (improving, declining, stable) with evidence
-4. Identify risk factors and opportunities
-5. Generate TWO outputs:
-
-   A. EXECUTIVE SUMMARY (150 words max):
-      - Overall sentiment score (1-10) and key takeaway
-      - Top 2-3 critical factors
-      - Immediate action required (if any)
-      - Relationship health status
-      - Suitable for C-level executives
-
-   B. COMPREHENSIVE ANALYSIS (500-800 words):
-      - Detailed breakdown of all factors influencing the score
-      - Specific concerns or positive signals with examples
-      - Relationship trajectory analysis with evidence
-      - Contact level involvement analysis (C-Level/Sr. Level in cases is major red flag)
-      - Support case patterns and implications
-      - Engagement metrics and their meaning
-      - Risk factors and opportunities
-      - Detailed actionable recommendations
-      - Account-specific context and nuances
-      - Comparison to account tier expectations
-
-CRITICAL: Apply recency weighting throughout:
+Apply RECENCY WEIGHTING throughout:
 - Recent data (0-30 days): 80-90% weight - PRIMARY indicators
 - Historical data (90+ days): 5-10% weight - context only
-- The sentiment score must reflect CURRENT customer sentiment based primarily on recent interactions
 
-Return your response as a JSON object with this exact structure:
+Watch for RED FLAGS:
+- C-Level involvement in support cases = MAJOR escalation concern
+- Sr. Level involvement in support cases = significant frustration
+- High priority/unresolved cases = active issues
+
+Analyze these factors:
+1. Conversation sentiment: tone, language patterns, satisfaction signals
+2. Support patterns: case trends, priorities, resolution quality
+3. Relationship trajectory: improving, declining, or stable
+4. Risk factors and opportunities
+
+=== OUTPUT FORMAT ===
+
+Return a JSON object with this EXACT structure:
 {{
-  "score": <integer 1-10>,
-  "summary": "<executive summary, 150 words max>",
-  "comprehensiveAnalysis": "<comprehensive analysis, 500-800 words>"
+  "score": <integer 1-10, where 1=very negative, 5=neutral, 10=very positive>,
+  "summary": "<executive summary, 150 words max - key takeaways for executives>",
+  "comprehensiveAnalysis": "<detailed analysis, 400-600 words - breakdown of factors, evidence, recommendations>"
 }}''',
-                agent=synthesizer,
-                expected_output='JSON object with score (1-10), summary (150 words max), and comprehensiveAnalysis (500-800 words) fields'
+                agent=sentiment_analyst,
+                expected_output='JSON object with score (1-10), summary (150 words), and comprehensiveAnalysis (400-600 words)'
             )
-            
-            # Create crew
+
+            # Create crew with single agent and task
             crew = Crew(
-                agents=[conversation_analyst, support_analyst, synthesizer],
-                tasks=[task1, task2, task3],
+                agents=[sentiment_analyst],
+                tasks=[analysis_task],
                 verbose=True
             )
             

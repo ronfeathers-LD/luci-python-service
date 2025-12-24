@@ -586,135 +586,67 @@ Industry: {account_data.get('industry', 'Unknown')}"""
             
             full_system_prompt = '\n'.join(system_prompt_parts) if system_prompt_parts else None
             
-            send_progress(self.wfile, 'Setup', 'Preparing analysis agents...', 'System')
+            send_progress(self.wfile, 'Setup', 'Preparing analysis...', 'System')
 
-            # Create agents from database config or fallback to defaults
-            agent_configs = crew_config.get('agent_configs', []) if crew_config else []
+            # OPTIMIZED: Single comprehensive agent instead of multiple agents
+            # This reduces LLM calls from 2 to 1, significantly improving performance
+            account_analyst = Agent(
+                role='Account Health & Strategy Analyst',
+                goal='Analyze account health, identify risks and opportunities, and provide actionable recommendations',
+                backstory='''You are an expert B2B account analyst who combines analytical skills with strategic thinking.
+You excel at identifying patterns in customer data, assessing relationship health, and developing actionable strategies.
+You always cite specific evidence from the data provided.''',
+                llm=llm,
+                verbose=True
+            )
 
-            if not agent_configs:
-                # Fallback to hardcoded defaults
-                agent_configs = [
-                    {
-                        'role': 'Account Health Analyst',
-                        'goal': 'Analyze account health, customer sentiment, and relationship status',
-                        'backstory': 'You are an expert B2B account analyst specializing in customer relationship management.'
-                    },
-                    {
-                        'role': 'Account Strategy Advisor',
-                        'goal': 'Develop actionable strategies to improve account health and reduce churn risk',
-                        'backstory': 'You are a strategic advisor with deep expertise in B2B account management.'
-                    }
-                ]
-
-            agents = []
-            agent_map = {}
-            
-            for agent_config in agent_configs:
-                agent = Agent(
-                    role=agent_config.get('role', 'Unknown'),
-                    goal=agent_config.get('goal', ''),
-                    backstory=agent_config.get('backstory', ''),
-                    llm=llm,
-                    verbose=True
-                )
-                agents.append(agent)
-                agent_map[agent_config.get('role')] = agent
-            
-            # Create tasks from database config or fallback to defaults
-            task_configs = crew_config.get('task_configs', []) if crew_config else []
-            
-            if not task_configs:
-                # Fallback to hardcoded defaults
-                task_configs = [
-                    {
-                        'description': f'''Analyze account health and sentiment using the following account data. CRITICAL: You must reference SPECIFIC data points, quotes, dates, and names from the provided information. Do NOT use generic placeholders.
+            # Single comprehensive task that combines analysis and strategy
+            task_description = f'''Analyze account health and provide strategic recommendations.
 
 {account_context}
 
-CRITICAL REQUIREMENTS - You MUST:
-1. Quote actual customer statements from meeting transcripts (include speaker names and meeting dates)
-2. Reference specific case numbers, subjects, and statuses by name
-3. Name actual contacts and their roles when discussing stakeholders
-4. Cite specific meeting dates and subjects when discussing sentiment trends
-5. Use actual account details (tier, value, industry) in your analysis
+=== ANALYSIS REQUIREMENTS ===
 
-Provide:
-1. Account health score (1-10) with detailed reasoning that cites specific evidence
-2. Key risk factors or positive indicators with specific evidence
-3. Sentiment analysis using actual quotes and meeting details
-4. Relationship trajectory with specific evidence
-5. Key stakeholders by name''',
-                        'expected_output': 'Comprehensive account health analysis that explicitly quotes customer statements, references specific case numbers and dates, and names actual contacts. Every claim must be backed by specific evidence from the provided data.',
-                        'agent': 'Account Health Analyst'
-                    },
-                    {
-                        'description': f'''Based on the detailed analysis provided, develop actionable strategies and recommendations. CRITICAL: Your recommendations MUST directly address the specific issues, quotes, and data points identified in the analysis.
+You MUST reference SPECIFIC data points from the information above:
+- Quote actual customer statements with speaker names and dates
+- Reference specific case numbers, subjects, and statuses
+- Name actual contacts and their roles
+- Cite specific meeting dates and subjects
 
-Requirements:
-- Reference specific customer quotes and concerns from the analysis
-- Address actual case numbers and issues mentioned
-- Name specific contacts who need to be involved
-- Reference specific meeting dates and subjects when proposing follow-ups
-- Use actual account details (tier, value) to prioritize recommendations
-- Make recommendations specific to the actual problems identified, not generic advice''',
-                        'expected_output': 'Highly specific, actionable strategy recommendations that directly reference customer quotes, case numbers, contact names, and meeting dates from the analysis. Each recommendation must be tied to specific evidence.',
-                        'agent': 'Account Strategy Advisor',
-                        'context': ['analysis_task']
-                    }
-                ]
-            
-            tasks = []
-            task_map = {}
-            
-            for i, task_config in enumerate(task_configs):
-                task_description = task_config.get('description', '')
-                
-                # Replace {account_context} placeholder if present
-                if '{account_context}' in task_description:
-                    task_description = task_description.replace('{account_context}', account_context)
-                elif account_context and i == 0:
-                    task_description = f"{task_description}\n\n{account_context}"
-                
-                # Add system prompt to first task if available
-                if full_system_prompt and i == 0:
-                    task_description = f"{full_system_prompt}\n\n{task_description}"
-                
-                agent_role = task_config.get('agent', '')
-                agent = agent_map.get(agent_role)
-                if not agent:
-                    print(f'Warning: Agent "{agent_role}" not found, using first agent')
-                    agent = agents[0] if agents else None
-                
-                if not agent:
-                    raise ValueError('No agents available for tasks')
-                
-                task_context = []
-                context_refs = task_config.get('context', [])
-                for ref in context_refs:
-                    if ref in task_map:
-                        task_context.append(task_map[ref])
-                
-                task = Task(
-                    description=task_description,
-                    expected_output=task_config.get('expected_output', ''),
-                    agent=agent,
-                    context=task_context if task_context else None
-                )
-                
-                tasks.append(task)
-                task_id = task_config.get('id') or f'task_{i}'
-                task_map[task_id] = task
-                if 'analysis' in task_config.get('description', '').lower() or i == 0:
-                    task_map['analysis_task'] = task
-                if 'strategy' in task_config.get('description', '').lower() or i == 1:
-                    task_map['strategy_task'] = task
-            
-            # Send progress updates for each agent that will work
-            for i, agent_config in enumerate(agent_configs):
-                agent_name = agent_config.get('role', f'Agent {i+1}')
-                send_progress(self.wfile, f'Step {i+1}', f'Analyzing account data...', agent_name)
+=== OUTPUT FORMAT ===
 
-            crew = Crew(agents=agents, tasks=tasks, verbose=True)
+Provide a comprehensive analysis with these sections:
+
+1. ACCOUNT HEALTH SCORE (1-10)
+   - Score with clear justification citing specific evidence
+   - Key factors influencing the score
+
+2. RISK FACTORS & OPPORTUNITIES
+   - Specific risks with evidence (case numbers, quotes, patterns)
+   - Opportunities for improvement or expansion
+
+3. RELATIONSHIP ASSESSMENT
+   - Current sentiment based on recent interactions
+   - Trajectory (improving, declining, stable) with evidence
+   - Key stakeholders by name and their roles
+
+4. STRATEGIC RECOMMENDATIONS
+   - 3-5 actionable recommendations
+   - Each tied to specific issues identified
+   - Include who to contact and what to discuss'''
+
+            if full_system_prompt:
+                task_description = f"{full_system_prompt}\n\n{task_description}"
+
+            analysis_task = Task(
+                description=task_description,
+                expected_output='Comprehensive account analysis with health score, risk/opportunity assessment, relationship analysis, and actionable recommendations - all citing specific evidence from the data.',
+                agent=account_analyst
+            )
+
+            send_progress(self.wfile, 'Analysis', 'Running AI analysis...', 'Account Analyst')
+
+            crew = Crew(agents=[account_analyst], tasks=[analysis_task], verbose=True)
             result = crew.kickoff()
             result_text = str(result)
             
