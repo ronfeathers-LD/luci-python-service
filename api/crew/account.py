@@ -588,16 +588,18 @@ Industry: {account_data.get('industry', 'Unknown')}"""
             
             send_progress(self.wfile, 'Setup', 'Preparing analysis...', 'System')
 
-            # OPTIMIZED: Single comprehensive agent instead of multiple agents
-            # This reduces LLM calls from 2 to 1, significantly improving performance
+            # OPTIMIZED: Single agent with minimal iterations to reduce LLM calls
+            # - max_iter=1: Single pass, no reasoning loop
+            # - allow_delegation=False: No delegation overhead
+            # - verbose=False: Reduces internal processing
             account_analyst = Agent(
-                role='Account Health & Strategy Analyst',
-                goal='Analyze account health, identify risks and opportunities, and provide actionable recommendations',
-                backstory='''You are an expert B2B account analyst who combines analytical skills with strategic thinking.
-You excel at identifying patterns in customer data, assessing relationship health, and developing actionable strategies.
-You always cite specific evidence from the data provided.''',
+                role='Account Analyst',
+                goal='Analyze account health and provide recommendations with specific evidence',
+                backstory='Expert account analyst. Cite specific data in your analysis.',
                 llm=llm,
-                verbose=True
+                verbose=False,
+                allow_delegation=False,
+                max_iter=1
             )
 
             # Single comprehensive task that combines analysis and strategy
@@ -646,7 +648,7 @@ Provide a comprehensive analysis with these sections:
 
             send_progress(self.wfile, 'Analysis', 'Running AI analysis...', 'Account Analyst')
 
-            crew = Crew(agents=[account_analyst], tasks=[analysis_task], verbose=True)
+            crew = Crew(agents=[account_analyst], tasks=[analysis_task], verbose=False)
             result = crew.kickoff()
             result_text = str(result)
             

@@ -286,21 +286,18 @@ class handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f'Step callback error: {e}')
 
-            # OPTIMIZED: Single comprehensive agent instead of 3 separate agents
-            # This reduces LLM calls from 3 to 1, significantly improving performance
+            # OPTIMIZED: Single agent with minimal iterations to reduce LLM calls
+            # - max_iter=1: Single pass, no reasoning loop
+            # - allow_delegation=False: No delegation overhead
+            # - verbose=False: Reduces internal processing
             sentiment_analyst = Agent(
-                role='Customer Sentiment Analyst',
-                goal='Analyze customer sentiment from conversations and support data, producing a comprehensive assessment with score (1-10), executive summary, and detailed analysis',
-                backstory='''You are an expert B2B customer sentiment analyst who synthesizes conversation data,
-support cases, and account context into actionable insights. You excel at:
-- Identifying emotional tone and satisfaction signals from conversations
-- Recognizing patterns in support case data that indicate customer health
-- Understanding that C-Level/Sr. involvement in cases indicates escalation
-- Applying recency weighting (recent data 80-90%, historical 5-10%)
-- Producing clear executive summaries and detailed analysis''',
+                role='Sentiment Analyst',
+                goal='Analyze sentiment and return JSON with score, summary, and analysis',
+                backstory='Expert sentiment analyst. Respond directly with the requested JSON output.',
                 llm=llm,
-                verbose=True,
-                step_callback=agent_step_callback
+                verbose=False,
+                allow_delegation=False,
+                max_iter=1
             )
             
             # OPTIMIZED: Single comprehensive task instead of 3 separate tasks
@@ -370,14 +367,14 @@ Return a JSON object with this EXACT structure:
                 expected_output='JSON object with score (1-10), summary (150 words), and comprehensiveAnalysis (400-600 words)'
             )
 
-            # Create crew with single agent and task
+            # Create crew with single agent and task - verbose=False for performance
             crew = Crew(
                 agents=[sentiment_analyst],
                 tasks=[analysis_task],
-                verbose=True
+                verbose=False
             )
-            
-            send_progress(self.wfile, 'Analysis', 'Running AI analysis (this may take 1-3 minutes)...', 'AI Crew')
+
+            send_progress(self.wfile, 'Analysis', 'Running AI analysis...', 'AI Crew')
 
             # Execute crew - this is the main analysis step and takes the longest
             result = crew.kickoff()
