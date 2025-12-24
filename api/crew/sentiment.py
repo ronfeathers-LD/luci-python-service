@@ -136,6 +136,8 @@ class handler(BaseHTTPRequestHandler):
             avoma_context = None
             context_source = 'traditional'  # Track where context came from
 
+            print(f'RAG check: use_rag={use_rag}, account_id={account_id}, salesforce_account_id={salesforce_account_id}')
+
             if use_rag and (account_id or salesforce_account_id):
                 # Step 1: Try RAG (fastest - uses pre-computed embeddings)
                 try:
@@ -144,27 +146,39 @@ class handler(BaseHTTPRequestHandler):
                     send_progress(self.wfile, 'RAG Search', 'Retrieving relevant context from vector database...', 'System')
 
                     # Get the account UUID for RAG search
-                    rag_account_id = account_id
-                    if not rag_account_id and salesforce_account_id:
-                        # Resolve salesforce_account_id to UUID
+                    # Check if account_id is already a UUID (contains dashes and is 36 chars)
+                    is_uuid = account_id and '-' in account_id and len(account_id) == 36
+                    rag_account_id = account_id if is_uuid else None
+
+                    # If not a UUID, resolve from salesforce_id
+                    if not rag_account_id:
                         from supabase import create_client
                         supabase_url = os.environ.get('SUPABASE_URL')
                         supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
                         if supabase_url and supabase_key:
                             client = create_client(supabase_url, supabase_key)
-                            result = client.table('accounts').select('id').eq('salesforce_id', salesforce_account_id).limit(1).execute()
-                            if result.data:
-                                rag_account_id = result.data[0]['id']
+                            lookup_id = salesforce_account_id or account_id
+                            if lookup_id:
+                                result = client.table('accounts').select('id').eq('salesforce_id', lookup_id).limit(1).execute()
+                                if result.data:
+                                    rag_account_id = result.data[0]['id']
+                                    print(f'Resolved account UUID: {rag_account_id} from salesforce_id: {lookup_id}')
+                                else:
+                                    print(f'Could not resolve salesforce_id {lookup_id} to UUID')
+
+                    print(f'RAG account_id for search: {rag_account_id}')
 
                     if rag_account_id:
                         # Generate sentiment-specific query for embedding search
                         analysis_query = get_analysis_query('sentiment')
+                        print(f'Calling get_relevant_context with account_id={rag_account_id}')
                         rag_result = get_relevant_context(
                             account_id=rag_account_id,
                             query=analysis_query,
                             match_count=15,  # Get relevant chunks for sentiment
                             match_threshold=0.4  # Lower threshold for broader coverage
                         )
+                        print(f'RAG result: {len(rag_result.get("chunks", []))} chunks, context length: {len(rag_result.get("context", ""))}')
                         if rag_result.get('context'):
                             rag_context = rag_result['context']
                             context_source = 'rag'
