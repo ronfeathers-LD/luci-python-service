@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='crewai')
 warnings.filterwarnings('ignore', category=UserWarning, module='pydantic')
 
 # Import shared helpers
-from database_helpers import get_supabase_client
+from crew.database_helpers import get_supabase_client
 
 # Lazy-loaded modules
 _langchain_openai = None
