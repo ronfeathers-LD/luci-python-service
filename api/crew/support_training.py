@@ -123,8 +123,8 @@ def fetch_similar_resolved_cases(supabase, case_type: str, case_subject: str, ow
             'case_number, subject, type, closed_date'
         ).eq(
             'owner_id', owner_id
-        ).not_(
-            'closed_date', 'is', None
+        ).not_.is_(
+            'closed_date', 'null'
         ).order(
             'closed_date', desc=True
         ).limit(50).execute()

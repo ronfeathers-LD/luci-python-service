@@ -79,10 +79,10 @@ def fetch_agent_metrics(supabase, days_back: int = 90) -> List[Dict[str, Any]]:
     # Get all closed cases with owner info
     result = supabase.table('cases').select(
         'owner_id, owner_name, created_date, closed_date, case_number, subject, type'
-    ).not_(
-        'closed_date', 'is', None
-    ).not_(
-        'owner_id', 'is', None
+    ).not_.is_(
+        'closed_date', 'null'
+    ).not_.is_(
+        'owner_id', 'null'
     ).gte(
         'closed_date', cutoff_date
     ).execute()
