@@ -11,7 +11,6 @@ import os
 import sys
 import warnings
 import urllib.request
-import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from typing import Optional, List, Dict
 
