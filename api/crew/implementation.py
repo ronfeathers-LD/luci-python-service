@@ -35,7 +35,7 @@ def fetch_project_data(salesforce_project_id: Optional[str] = None):
         if not salesforce_project_id:
             raise ValueError('salesforceProjectId is required')
         
-        result = supabase.table('implementation_projects').select('*').eq('salesforce_id', salesforce_project_id).limit(1).execute()
+        result = supabase.table('implementation_projects').select('*').eq('salesforce_project_id', salesforce_project_id).limit(1).execute()
         
         if not result.data or len(result.data) == 0:
             raise ValueError('Project not found')
