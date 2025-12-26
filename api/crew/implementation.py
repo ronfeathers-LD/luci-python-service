@@ -17,6 +17,7 @@ from sse_helpers import start_sse_response, send_progress, send_result, send_err
 # Import shared helpers (includes warning suppression and lazy loading)
 from crew.llm_helpers import get_llm, get_crewai
 from crew.database_helpers import fetch_crew_config, save_analysis_to_database, build_system_prompt
+from crew.mavenlink_helpers import build_pm_workflow_context, calculate_task_metrics, identify_pm_workflow_issues
 
 def fetch_project_data(salesforce_project_id: Optional[str] = None):
     """Fetch project data and transcriptions from Supabase"""
@@ -128,6 +129,11 @@ class handler(BaseHTTPRequestHandler):
             project_data = body.get('projectData')
             transcriptions = body.get('transcriptions', [])
 
+            # Get Mavenlink data if available (passed from Next.js route)
+            mavenlink_tasks = body.get('mavenlinkTasks', [])
+            mavenlink_time_entries = body.get('mavenlinkTimeEntries', [])
+            mavenlink_workspace_id = body.get('mavenlinkWorkspaceId')
+
             if not project_data:
                 send_progress(self.wfile, 'Data Fetching', 'Fetching project data from database...', 'System')
                 # Try to fetch from salesforceProjectId
@@ -157,7 +163,27 @@ class handler(BaseHTTPRequestHandler):
 Status: {project_data.get('status', 'Unknown')}
 Account: {project_data.get('account_name', 'Unknown')}
 Transcripts: {len(transcriptions)}"""
-            
+
+            # Add Mavenlink PM workflow data if available
+            if mavenlink_tasks:
+                send_progress(self.wfile, 'Mavenlink Analysis', f'Analyzing {len(mavenlink_tasks)} Mavenlink tasks...', 'System')
+                pm_workflow_context = build_pm_workflow_context(
+                    tasks=mavenlink_tasks,
+                    time_entries=mavenlink_time_entries if mavenlink_time_entries else None,
+                    workspace_id=mavenlink_workspace_id
+                )
+                project_context += f"\n\n{pm_workflow_context}"
+
+                # Add specific workflow issues for emphasis
+                task_metrics = calculate_task_metrics(mavenlink_tasks)
+                issues = identify_pm_workflow_issues(task_metrics)
+                if issues:
+                    project_context += f"\n\n=== CRITICAL PM ISSUES TO ADDRESS ===\n"
+                    for i, issue in enumerate(issues, 1):
+                        project_context += f"{i}. {issue}\n"
+            else:
+                project_context += "\n\n[No Mavenlink task data available - analysis based on meeting transcripts only]"
+
             # Add transcript summaries if available
             if transcriptions:
                 transcript_summaries = []
@@ -168,7 +194,7 @@ Transcripts: {len(transcriptions)}"""
                         # Truncate long transcripts
                         preview = transcript_text[:500] + '...' if len(transcript_text) > 500 else transcript_text
                         transcript_summaries.append(f"Meeting {i}: {meeting.get('subject', 'No subject')} ({meeting.get('meeting_date', 'Unknown date')}) - {preview}")
-                
+
                 if transcript_summaries:
                     project_context += f"\n\nRecent Meeting Transcripts:\n" + "\n".join(transcript_summaries)
             
@@ -191,13 +217,13 @@ Transcripts: {len(transcriptions)}"""
                 agent_configs = [
                     {
                         'role': 'Implementation PM Analyst',
-                        'goal': 'Analyze project management effectiveness and communication patterns',
-                        'backstory': 'You are an expert in implementation project management and customer communication.'
+                        'goal': 'Analyze project management effectiveness, task execution, and communication patterns using Mavenlink data and meeting transcripts',
+                        'backstory': 'You are an expert in implementation project management. You analyze Mavenlink task data, time tracking, and meeting transcripts to assess PM workflow effectiveness and identify issues.'
                     },
                     {
                         'role': 'Implementation Coach',
-                        'goal': 'Provide specific, actionable coaching recommendations',
-                        'backstory': 'You are an expert implementation coach specializing in customer communication and project management.'
+                        'goal': 'Provide specific, actionable coaching recommendations based on PM workflow analysis',
+                        'backstory': 'You are an expert implementation coach who reviews PM performance data and provides targeted coaching on task management, time tracking, and customer communication.'
                     }
                 ]
 
@@ -219,23 +245,62 @@ Transcripts: {len(transcriptions)}"""
             task_configs = crew_config.get('task_configs', []) if crew_config else []
             
             if not task_configs:
-                # Fallback to hardcoded defaults
+                # Fallback to hardcoded defaults with Mavenlink focus
                 task_configs = [
                     {
-                        'description': f'''Analyze project management and communication. {project_context}
-                        
-                        Provide:
-                        1. PM effectiveness assessment
-                        2. Communication pattern analysis
-                        3. Key strengths and areas for improvement
-                        4. Risk factors
-                        5. Timeline and milestone assessment''',
-                        'expected_output': 'Comprehensive PM and communication analysis',
+                        'description': f'''Analyze the Project Manager's workflow effectiveness using all available data.
+
+{project_context}
+
+ANALYZE THE PM'S WORKFLOW:
+
+1. **Task Management Assessment**
+   - Are tasks being created with clear descriptions and due dates?
+   - What is the task completion rate and velocity?
+   - Are there overdue or blocked tasks? Why?
+   - Is work being broken down appropriately?
+
+2. **Time Tracking Discipline**
+   - Is time being logged consistently?
+   - Are there gaps in time tracking?
+   - Does logged time align with task progress?
+
+3. **Project Momentum**
+   - Is there consistent forward progress?
+   - Are there periods of stagnation?
+   - How quickly are blockers being resolved?
+
+4. **Communication Patterns** (from meeting transcripts)
+   - Is the PM communicating proactively with the customer?
+   - Are issues being addressed in meetings?
+   - Is there follow-through on action items?
+
+5. **Risk Assessment**
+   - What are the current project risks?
+   - Are there warning signs of trouble?
+   - What needs immediate attention?
+
+Provide a detailed assessment with specific examples from the data.''',
+                        'expected_output': 'Comprehensive PM workflow analysis with specific metrics, identified issues, and risk assessment',
                         'agent': 'Implementation PM Analyst'
                     },
                     {
-                        'description': 'Based on the analysis, provide specific coaching recommendations with examples.',
-                        'expected_output': 'Specific, actionable coaching recommendations with examples',
+                        'description': '''Based on the PM workflow analysis, provide specific coaching recommendations.
+
+For each issue identified, provide:
+1. **The Problem**: What specific behavior or pattern needs to change
+2. **The Impact**: Why this matters for project success
+3. **The Recommendation**: Specific, actionable steps to improve
+4. **Example**: A concrete example of what good looks like
+
+Focus on:
+- Task management habits (creation, updates, completion)
+- Time tracking discipline
+- Communication improvements
+- Proactive risk management
+
+Be direct and specific. Avoid generic advice. Reference actual data from the analysis.''',
+                        'expected_output': 'Specific, actionable coaching recommendations with examples and clear next steps',
                         'agent': 'Implementation Coach',
                         'context': ['pm_analysis_task']
                     }
