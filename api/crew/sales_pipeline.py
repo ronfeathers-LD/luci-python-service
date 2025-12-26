@@ -9,7 +9,6 @@ inside functions to reduce cold start time by ~1-2 seconds.
 import json
 import os
 import sys
-import warnings
 from http.server import BaseHTTPRequestHandler
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
@@ -18,90 +17,9 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sse_helpers import start_sse_response, send_progress, send_result, send_error
 
-# Suppress warnings early (before heavy imports)
-warnings.filterwarnings('ignore', message='.*Overriding of current TracerProvider.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='opentelemetry')
-warnings.filterwarnings('ignore', category=SyntaxWarning, module='langchain')
-warnings.filterwarnings('ignore', message='.*pkg_resources is deprecated.*')
-warnings.filterwarnings('ignore', message='.*Mixing V1 models and V2 models.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='crewai')
-warnings.filterwarnings('ignore', category=UserWarning, module='pydantic')
-
-# Lazy-loaded modules (cached after first import)
-_langchain_openai = None
-_crewai = None
-
-
-def _get_langchain_openai():
-    """Lazy load langchain_openai module"""
-    global _langchain_openai
-    if _langchain_openai is None:
-        from langchain_openai import ChatOpenAI
-        _langchain_openai = ChatOpenAI
-    return _langchain_openai
-
-
-def _get_crewai():
-    """Lazy load crewai module"""
-    global _crewai
-    if _crewai is None:
-        from crewai import Crew, Agent, Task
-        _crewai = {'Crew': Crew, 'Agent': Agent, 'Task': Task}
-    return _crewai
-
-
-def get_llm(openai_api_key: Optional[str] = None):
-    """Get OpenAI LLM instance (lazy loads langchain_openai)"""
-    ChatOpenAI = _get_langchain_openai()
-    api_key = openai_api_key or os.environ.get('OPENAI_API_KEY')
-    if not api_key:
-        raise ValueError('OPENAI_API_KEY is required')
-    os.environ['OPENAI_API_KEY'] = api_key
-    return ChatOpenAI(
-        api_key=api_key,
-        model=os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-        temperature=0.7
-    )
-
-
-def fetch_crew_config(crew_type: str) -> Optional[Dict[str, Any]]:
-    """Fetch crew configuration from Supabase database"""
-    try:
-        from supabase import create_client, Client
-
-        supabase_url = os.environ.get('SUPABASE_URL')
-        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-
-        if not supabase_url or not supabase_key:
-            print('Warning: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set')
-            return None
-
-        supabase: Client = create_client(supabase_url, supabase_key)
-
-        result = supabase.table('crews').select('*').eq('crew_type', crew_type).eq('enabled', True).limit(1).execute()
-
-        if not result.data or len(result.data) == 0:
-            print(f'Warning: Crew config not found for crew_type: {crew_type}')
-            return None
-
-        crew = result.data[0]
-
-        config = {
-            'name': crew.get('name'),
-            'description': crew.get('description'),
-            'system_prompt': crew.get('system_prompt'),
-            'evaluation_criteria': crew.get('evaluation_criteria'),
-            'scoring_rubric': crew.get('scoring_rubric'),
-            'output_schema': crew.get('output_schema'),
-            'agent_configs': crew.get('agent_configs') or [],
-            'task_configs': crew.get('task_configs') or [],
-        }
-
-        return config
-
-    except Exception as e:
-        print(f'Error fetching crew config from database: {e}')
-        return None
+# Import shared helpers (includes warning suppression and lazy loading)
+from crew.llm_helpers import get_llm, get_crewai
+from crew.database_helpers import fetch_crew_config, save_analysis_to_database, build_system_prompt
 
 
 def fetch_user_opportunities(user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
@@ -389,8 +307,8 @@ class handler(BaseHTTPRequestHandler):
 
             send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
 
-            # Lazy load crewai classes
-            crewai = _get_crewai()
+            # Get lazy-loaded crewai classes
+            crewai = get_crewai()
             Agent = crewai['Agent']
             Task = crewai['Task']
             Crew = crewai['Crew']
@@ -436,14 +354,8 @@ class handler(BaseHTTPRequestHandler):
 
             send_progress(self.wfile, 'Setup', 'Preparing analysis...', 'System')
 
-            # Build system prompt
-            system_prompt_parts = []
-            if crew_config and crew_config.get('system_prompt'):
-                system_prompt_parts.append(crew_config['system_prompt'])
-            if crew_config and crew_config.get('evaluation_criteria'):
-                system_prompt_parts.append('\n\n' + crew_config['evaluation_criteria'])
-
-            full_system_prompt = '\n'.join(system_prompt_parts) if system_prompt_parts else None
+            # Build system prompt using shared helper
+            full_system_prompt = build_system_prompt(crew_config)
 
             # Single optimized agent
             pipeline_analyst = Agent(
@@ -517,24 +429,12 @@ End with STRATEGIC RECOMMENDATIONS:
             result = crew.kickoff()
             result_text = str(result)
 
-            # Save to database
-            try:
-                from supabase import create_client, Client
-
-                if supabase_url and supabase_key:
-                    supabase: Client = create_client(supabase_url, supabase_key)
-
-                    save_data = {
-                        'user_id': user_id,
-                        'crew_type': 'sales_pipeline',
-                        'result': result_text,
-                        'provider': 'openai',
-                        'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-                    }
-
-                    supabase.table('crew_analysis_history').insert(save_data).execute()
-            except Exception as save_error:
-                print(f'Error saving crew analysis to database: {save_error}')
+            # Save to database using shared helper
+            save_analysis_to_database(
+                crew_type='sales_pipeline',
+                result=result_text,
+                user_id=user_id
+            )
 
             # Send final result
             model_name = os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')

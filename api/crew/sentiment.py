@@ -9,7 +9,6 @@ inside functions to reduce cold start time by ~1-2 seconds.
 import json
 import os
 import sys
-import warnings
 from http.server import BaseHTTPRequestHandler
 from typing import Optional
 
@@ -17,47 +16,9 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sse_helpers import start_sse_response, send_progress, send_result, send_error, send_sse_message
 
-# Suppress warnings early (before heavy imports)
-warnings.filterwarnings('ignore', message='.*Overriding of current TracerProvider.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='opentelemetry')
-warnings.filterwarnings('ignore', category=SyntaxWarning, module='langchain')
-warnings.filterwarnings('ignore', message='.*pkg_resources is deprecated.*')
-warnings.filterwarnings('ignore', message='.*Mixing V1 models and V2 models.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='crewai')
-warnings.filterwarnings('ignore', category=UserWarning, module='pydantic')
-
-# Lazy-loaded modules (cached after first import)
-_langchain_openai = None
-_crewai = None
-
-def _get_langchain_openai():
-    """Lazy load langchain_openai module"""
-    global _langchain_openai
-    if _langchain_openai is None:
-        from langchain_openai import ChatOpenAI
-        _langchain_openai = ChatOpenAI
-    return _langchain_openai
-
-def _get_crewai():
-    """Lazy load crewai module"""
-    global _crewai
-    if _crewai is None:
-        from crewai import Crew, Agent, Task
-        _crewai = {'Crew': Crew, 'Agent': Agent, 'Task': Task}
-    return _crewai
-
-def get_llm(openai_api_key: Optional[str] = None):
-    """Get OpenAI LLM instance (lazy loads langchain_openai)"""
-    ChatOpenAI = _get_langchain_openai()
-    api_key = openai_api_key or os.environ.get('OPENAI_API_KEY')
-    if not api_key:
-        raise ValueError('OPENAI_API_KEY is required')
-    os.environ['OPENAI_API_KEY'] = api_key
-    return ChatOpenAI(
-        api_key=api_key,
-        model=os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-        temperature=0.7
-    )
+# Import shared helpers (includes warning suppression and lazy loading)
+from crew.llm_helpers import get_llm, get_crewai
+from crew.database_helpers import save_analysis_to_database
 
 class handler(BaseHTTPRequestHandler):
     """Main handler for Sentiment Analysis Crew requests - Vercel format"""
@@ -112,8 +73,8 @@ class handler(BaseHTTPRequestHandler):
             
             send_progress(self.wfile, 'Initialization', 'Initializing AI model...', 'System')
 
-            # Lazy load crewai classes (reduces cold start time)
-            crewai = _get_crewai()
+            # Get lazy-loaded crewai classes
+            crewai = get_crewai()
             Agent = crewai['Agent']
             Task = crewai['Task']
             Crew = crewai['Crew']
@@ -429,59 +390,14 @@ Return a JSON object with this EXACT structure:
                 "comprehensiveAnalysis": comprehensive_analysis or result_text
             }
 
-            # Save to database (same pattern as account.py)
-            try:
-                from supabase import create_client, Client
-
-                supabase_url = os.environ.get('SUPABASE_URL')
-                supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-
-                if supabase_url and supabase_key:
-                    supabase: Client = create_client(supabase_url, supabase_key)
-
-                    # Get IDs from request body
-                    user_id = body.get('userId')
-                    account_id = body.get('accountId')
-                    salesforce_account_id = body.get('salesforceAccountId')
-
-                    if user_id or account_id or salesforce_account_id:
-                        # Resolve account_id from salesforce_account_id if needed
-                        resolved_account_id = account_id
-                        if not resolved_account_id and salesforce_account_id:
-                            try:
-                                acc_result = supabase.table('accounts').select('id').eq('salesforce_id', salesforce_account_id).limit(1).execute()
-                                if acc_result.data and len(acc_result.data) > 0:
-                                    resolved_account_id = acc_result.data[0].get('id')
-                            except Exception as acc_err:
-                                print(f'Warning: Could not resolve account_id from salesforce_account_id: {acc_err}')
-
-                        # Save to crew_analysis_history
-                        save_data = {
-                            'crew_type': 'sentiment',
-                            'result': json.dumps(final_result),
-                            'provider': 'openai',
-                            'model': os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini'),
-                        }
-
-                        if user_id:
-                            save_data['user_id'] = user_id
-                        if resolved_account_id:
-                            save_data['account_id'] = resolved_account_id
-                        if salesforce_account_id:
-                            save_data['salesforce_account_id'] = salesforce_account_id
-
-                        result_insert = supabase.table('crew_analysis_history').insert(save_data).execute()
-                        if hasattr(result_insert, 'error') and result_insert.error:
-                            print(f'Error saving sentiment analysis to database: {result_insert.error}')
-                        else:
-                            print(f'✅ Saved sentiment analysis to crew_analysis_history')
-                    else:
-                        print('Warning: No userId/accountId/salesforceAccountId provided, skipping database save')
-                else:
-                    print('Warning: Supabase URL or Key not set, skipping database save')
-            except Exception as save_error:
-                # Don't fail the request if save fails - just log it
-                print(f'Error saving sentiment analysis to database: {save_error}')
+            # Save to database using shared helper
+            save_analysis_to_database(
+                crew_type='sentiment',
+                result=json.dumps(final_result),
+                user_id=body.get('userId'),
+                account_id=body.get('accountId'),
+                salesforce_account_id=body.get('salesforceAccountId')
+            )
 
             # Send final result via SSE
             # The Next.js route does: finalResult = data.result || data
