@@ -69,7 +69,7 @@ def fetch_project_and_transcriptions(
     if transcription_ids and len(transcription_ids) > 0:
         # Fetch specific transcriptions
         trans_result = supabase.table('transcriptions').select(
-            'id, transcription_text, meeting_subject, meeting_date, avoma_meeting_id'
+            'id, transcription_text, meeting_subject, meeting_date, avoma_meeting_uuid'
         ).in_('id', transcription_ids).execute()
 
         if trans_result.data:
@@ -79,7 +79,7 @@ def fetch_project_and_transcriptions(
         cutoff_date = (datetime.now() - timedelta(days=days_back)).isoformat()
 
         trans_result = supabase.table('transcriptions').select(
-            'id, transcription_text, meeting_subject, meeting_date, avoma_meeting_id'
+            'id, transcription_text, meeting_subject, meeting_date, avoma_meeting_uuid'
         ).eq(
             'salesforce_account_id', salesforce_account_id
         ).gte(
