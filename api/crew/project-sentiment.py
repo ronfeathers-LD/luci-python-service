@@ -452,15 +452,25 @@ SCORING RUBRIC:
             # Parse JSON from result
             parsed_result = None
             try:
-                # Handle markdown code blocks
-                if '```json' in result_text:
-                    result_text = result_text.split('```json')[1].split('```')[0]
-                elif '```' in result_text:
-                    parts = result_text.split('```')
-                    if len(parts) >= 2:
-                        result_text = parts[1]
+                # Handle markdown code blocks ONLY at the start of the response
+                # Don't check for ``` inside the JSON as it may appear in string values
+                stripped = result_text.strip()
+                if stripped.startswith('```json'):
+                    # Extract content between ```json and ```
+                    stripped = stripped[7:]  # Remove ```json
+                    end_block = stripped.find('```')
+                    if end_block > 0:
+                        stripped = stripped[:end_block]
+                    result_text = stripped.strip()
+                elif stripped.startswith('```'):
+                    # Extract content between ``` and ```
+                    stripped = stripped[3:]  # Remove ```
+                    end_block = stripped.find('```')
+                    if end_block > 0:
+                        stripped = stripped[:end_block]
+                    result_text = stripped.strip()
 
-                # Find JSON object
+                # Find JSON object - look for outermost { and }
                 start_idx = result_text.find('{')
                 end_idx = result_text.rfind('}') + 1
 
