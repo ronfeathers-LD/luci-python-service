@@ -412,7 +412,9 @@ SCORING RUBRIC:
             send_progress(self.wfile, 'Processing', 'AI analysis in progress...', 'AI Crew')
 
             result = crew.kickoff()
-            result_text = str(result.raw if hasattr(result, 'raw') else result)
+            # Use str(result) directly to get the output text (matches working sentiment.py)
+            # Don't use result.raw as it may be empty even when result has content
+            result_text = str(result)
 
             send_progress(self.wfile, 'Parsing', 'Processing results...', 'System')
 
