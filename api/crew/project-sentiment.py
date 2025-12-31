@@ -412,9 +412,40 @@ SCORING RUBRIC:
             send_progress(self.wfile, 'Processing', 'AI analysis in progress...', 'AI Crew')
 
             result = crew.kickoff()
-            # Use str(result) directly to get the output text (matches working sentiment.py)
-            # Don't use result.raw as it may be empty even when result has content
-            result_text = str(result)
+
+            # Debug: Log what the crew returned
+            print(f'[DEBUG] Crew result type: {type(result)}')
+            print(f'[DEBUG] Crew result dir: {[x for x in dir(result) if not x.startswith("_")]}')
+
+            # Try different ways to get the result content
+            result_text = ''
+            if hasattr(result, 'raw') and result.raw:
+                result_text = str(result.raw)
+                print(f'[DEBUG] Using result.raw, length: {len(result_text)}')
+            elif hasattr(result, 'output') and result.output:
+                result_text = str(result.output)
+                print(f'[DEBUG] Using result.output, length: {len(result_text)}')
+            elif hasattr(result, 'tasks_output') and result.tasks_output:
+                # CrewAI sometimes puts results in tasks_output
+                task_outputs = result.tasks_output
+                if task_outputs and len(task_outputs) > 0:
+                    last_task = task_outputs[-1]
+                    if hasattr(last_task, 'raw') and last_task.raw:
+                        result_text = str(last_task.raw)
+                        print(f'[DEBUG] Using tasks_output[-1].raw, length: {len(result_text)}')
+                    elif hasattr(last_task, 'output') and last_task.output:
+                        result_text = str(last_task.output)
+                        print(f'[DEBUG] Using tasks_output[-1].output, length: {len(result_text)}')
+                    else:
+                        result_text = str(last_task)
+                        print(f'[DEBUG] Using str(tasks_output[-1]), length: {len(result_text)}')
+
+            # Fallback to str(result)
+            if not result_text:
+                result_text = str(result)
+                print(f'[DEBUG] Using str(result), length: {len(result_text)}')
+
+            print(f'[DEBUG] Final result_text preview: {result_text[:500] if result_text else "EMPTY"}')
 
             send_progress(self.wfile, 'Parsing', 'Processing results...', 'System')
 
