@@ -12,3 +12,5 @@ pydantic>=2.0.0,<3.0.0
 setuptools<81.0.0
 supabase>=2.0.0,<3.0.0
 
+# Ensure cffi binary wheel is installed to avoid build-time compilation failures
+cffi>=1.15.1
