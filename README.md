@@ -47,3 +47,7 @@ Deployed on Vercel as Python 3.11 serverless functions with 5-minute max duratio
 ## Usage
 
 This service is called by the main LUCI Next.js application via API proxy routes. All endpoints stream progress updates via SSE and return structured AI insights with data citations.
+
+
+
+
